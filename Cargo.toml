@@ -1,0 +1,28 @@
+[package]
+name = "rhymuweb-client"
+version = "1.0.0"
+description = "HTTP user agent for fetching web resources"
+authors = ["Richard Walters <rwalters@digitalstirling.com>"]
+edition = "2018"
+license = "MIT"
+readme = "README.md"
+categories = ["web-programming"]
+keywords = ["http", "client"]
+repository = "https://github.com/rhymu8354/WebClient.git"
+exclude = [
+    "*.hpp",
+    "*.cpp",
+    "CMakeLists.txt"
+]
+
+[dependencies]
+async-std = "1.6"
+async-ctrlc = "1.2"
+async-tls = "0.10"
+futures = "0.3"
+rhymessage = { path = "../MessageHeaders" }
+rhymuri = "1.0"
+rhymuweb = { path = "../Http" }
+# rustls = "0.18"
+structopt = "0.3"
+thiserror = "1.0"
