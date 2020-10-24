@@ -18,12 +18,13 @@ use rhymuweb_client::Error;
 use std::error::Error as _;
 use structopt::StructOpt;
 
-async fn transact<S>(
+trait Stream: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> Stream for T {}
+
+async fn transact(
     raw_request: Vec<u8>,
-    mut stream: S
-) -> Result<Response, Error>
-    where S: AsyncRead + AsyncWrite + Unpin
-{
+    mut stream: Box<dyn Stream>
+) -> Result<(Response, Box<dyn Stream>), Error> {
     // Send the request to the server.
     stream.write_all(&raw_request).await
         .map_err(Error::UnableToSend)?;
@@ -48,7 +49,7 @@ async fn transact<S>(
             .map_err(Error::BadResponse)?;
         receive_buffer.drain(0..response_status.consumed);
         if response_status.status == ResponseParseStatus::Complete {
-            return Ok(response);
+            return Ok((response, stream));
         }
     }
 
@@ -64,71 +65,86 @@ async fn fetch<Req>(request: Req) -> Result<Response, Error>
     where Req: Into<Request>
 {
     let mut request: Request = request.into();
-    match request.target.authority() {
-        Some(authority) => {
-            // Determine the server hostname and include it in the request
-            // headers.
-            let host = std::str::from_utf8(authority.host())
-                .map_err(|_| Error::HostNotValidText(authority.host().to_vec()))?;
-            request.headers.set_header("Host", host);
+    if let Some(authority) = request.target.take_authority() {
+        // Remove scheme from the target.
+        let scheme = request.target.take_scheme();
 
-            // Store the body size in the request headers.
-            if !request.body.is_empty() {
-                request.headers.set_header(
-                    "Content-Length",
-                    request.body.len().to_string()
-                );
-            }
+        // Determine the server hostname and include it in the request
+        // headers.
+        let host = std::str::from_utf8(authority.host())
+            .map_err(|_| Error::HostNotValidText(authority.host().to_vec()))?;
+        request.headers.set_header("Host", host);
 
-            // Set other headers specific to the user agent.
-            request.headers.set_header("Accept-Encoding", "gzip, deflate");
-            request.headers.set_header("Connection", "Close");
-
-            // Determine the socket address of the server given
-            // the hostname and port number.
-            let port = authority.port()
-                .or_else(
-                    || match request.target.scheme() {
-                        Some("http") | Some("ws") => Some(80),
-                        Some("https") | Some("wss") => Some(443),
-                        _ => None,
-                    }
-                )
-                .ok_or_else(
-                    || Error::UnableToDetermineServerPort(request.target.clone())
-                )?;
-            let address = &format!("{}:{}", host, port);
-
-            // Generate the raw request byte stream.
-            let raw_request = request.generate()
-                .map_err(Error::BadRequest)?;
-
-            // Connect to the server.
-            println!("Connecting to '{}'...", address);
-            let stream = TcpStream::connect(address).await
-                .map_err(Error::UnableToConnect)?;
-            println!(
-                "Connected (address: {}).",
-                stream.peer_addr()
-                    .map_err(Error::UnableToGetPeerAddress)?
+        // Store the body size in the request headers.
+        if !request.body.is_empty() {
+            request.headers.set_header(
+                "Content-Length",
+                request.body.len().to_string()
             );
+        }
 
-            // Wrap with TLS connector if necessary.
-            if matches!(
-                request.target.scheme(),
-                Some("https") | Some("wss")
-            ) {
-                println!("Using TLS.");
-                let tls_connector = TlsConnector::default();
-                let tls_stream = tls_connector.connect(host, stream).await
-                    .map_err(Error::TlsHandshake)?;
-                transact(raw_request, tls_stream).await
-            } else {
-                println!("Not using TLS.");
-                transact(raw_request, stream).await
-            }
-        },
-        None => Err(Error::NoTargetAuthority(request.target)),
+        // Set other headers specific to the user agent.
+        // request.headers.set_header("Accept-Encoding", "gzip, deflate");
+        request.headers.set_header("Connection", "Close");
+
+        // Determine the socket address of the server given
+        // the hostname and port number.
+        let port = authority.port()
+            .or_else(
+                || match scheme.as_deref() {
+                    Some("http") | Some("ws") => Some(80),
+                    Some("https") | Some("wss") => Some(443),
+                    _ => None,
+                }
+            )
+            .ok_or_else(
+                || Error::UnableToDetermineServerPort(request.target.clone())
+            )?;
+        let address = &format!("{}:{}", host, port);
+
+        // Generate the raw request byte stream.
+        println!("Request:");
+        println!("{}", "=".repeat(78));
+        println!("{} {}", request.method, request.target);
+        for header in &request.headers {
+            println!("{}: {}", header.name, header.value);
+        }
+        println!();
+        match String::from_utf8(request.body.clone()) {
+            Err(_) => println!("(Body cannot be decoded as UTF-8)"),
+            Ok(body) => println!("{}", body),
+        };
+        println!("{}", "=".repeat(78));
+        let raw_request = request.generate()
+            .map_err(Error::BadRequest)?;
+
+        // Connect to the server.
+        println!("Connecting to '{}'...", address);
+        let stream = TcpStream::connect(address).await
+            .map_err(Error::UnableToConnect)?;
+        println!(
+            "Connected (address: {}).",
+            stream.peer_addr()
+                .map_err(Error::UnableToGetPeerAddress)?
+        );
+
+        // Wrap with TLS connector if necessary.
+        let stream: Box<dyn Stream> = if matches!(
+            scheme.as_deref(),
+            Some("https") | Some("wss")
+        ) {
+            println!("Using TLS.");
+            let tls_connector = TlsConnector::default();
+            let tls_stream = tls_connector.connect(host, stream).await
+                .map_err(Error::TlsHandshake)?;
+            Box::new(tls_stream)
+        } else {
+            println!("Not using TLS.");
+            Box::new(stream)
+        };
+        Ok(transact(raw_request, stream).await?.0)
+    } else {
+        Err(Error::NoTargetAuthority(request.target))
     }
 }
 
@@ -155,6 +171,8 @@ fn main() {
             };
         },
         Some(Ok(response)) => {
+            println!("Response:");
+            println!("{}", "=".repeat(78));
             println!("{} {}", response.status_code, response.reason_phrase);
             for header in response.headers {
                 println!("{}: {}", header.name, header.value);
@@ -164,6 +182,7 @@ fn main() {
                 Err(_) => println!("(Body cannot be decoded as UTF-8)"),
                 Ok(body) => println!("{}", body),
             };
+            println!("{}", "=".repeat(78));
         },
         None => {
             println!("(Ctrl+C pressed; aborted)");

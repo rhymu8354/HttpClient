@@ -21,7 +21,7 @@ async-ctrlc = "1.2"
 async-tls = "0.10"
 futures = "0.3"
 rhymessage = { path = "../MessageHeaders" }
-rhymuri = "1.0"
+rhymuri = { path = "../Uri" }
 rhymuweb = { path = "../Http" }
 # rustls = "0.18"
 thiserror = "1.0"
