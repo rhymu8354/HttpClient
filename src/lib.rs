@@ -30,86 +30,67 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::thread;
 
-pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Stream for T {}
+pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
 
-struct ParkedConnection {
-    // stream: Box<dyn Stream>,
-    request_in: oneshot::Sender<oneshot::Sender<Option<Box<dyn Stream>>>>,
-
-    monitor: Option<Pin<Box<dyn futures::Future<Output=()>>>>,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConnectionKey {
+    host: String,
+    port: u16,
+    use_tls: bool,
 }
 
+type ConnectionSender = oneshot::Sender<Option<Box<dyn Connection>>>;
+type ConnectionRequester = oneshot::Sender<ConnectionSender>;
+type ConnectionRequestee = oneshot::Receiver<ConnectionSender>;
+
 async fn monitor_connection(
-    mut connection: Box<dyn Stream>,
-    receiver: oneshot::Receiver<oneshot::Sender<Option<Box<dyn Stream>>>>,
-) {
+    mut connection: Box<dyn Connection>,
+    receiver: ConnectionRequestee,
+) -> bool {
+    println!("Now monitoring parked connection");
     let mut buffer = [0; 1];
     select!(
         _ = connection.read(&mut buffer).fuse() => {
+            println!("Connection broken");
         },
         sender = receiver.fuse() => {
+            println!("Received request to recycle connection");
             if let Ok(sender) = sender {
+                println!("Sending connection to requestor");
                 sender.send(Some(connection)).unwrap_or(());
+            } else {
+                println!("No path back to requestor!");
             }
         },
-    )
+    );
+    false
 }
 
 struct ParkedConnectionPool {
-    connections: HashMap<usize, ParkedConnection>,
-    next: usize,
+    requesters: Vec<ConnectionRequester>,
+    monitors: Vec<Pin<Box<dyn futures::Future<Output=bool>>>>,
 }
 
 impl ParkedConnectionPool {
     fn add(
         &mut self,
-        stream: Box<dyn Stream>,
+        connection: Box<dyn Connection>,
     ) {
-        let key = self.next;
-        self.next += 1;
         let (sender, receiver) = oneshot::channel();
-        let parked_connection = ParkedConnection{
-            request_in: sender,
-            monitor: Some(monitor_connection(stream, receiver).boxed()),
-        };
-        self.connections.insert(key, parked_connection);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.connections.is_empty()
+        self.requesters.push(sender);
+        self.monitors.push(monitor_connection(connection, receiver).boxed());
     }
 
     fn new() -> Self {
         Self {
-            connections: HashMap::new(),
-            next: 0,
+            requesters: Vec::new(),
+            monitors: Vec::new(),
         }
     }
 
-    async fn remove(&mut self) -> Option<Box<dyn Stream>> {
-        let key = match self.connections.keys().next() {
-            Some(key) => *key,
-            None => return None,
-        };
-        if let Some(parked_connection) = self.connections.remove(&key) {
-            // NOTE: At this point we probably want to return
-            // `parked_connection` so that we can stop borrowing the connection
-            // pool, before sending our sender and receiving back the stream.
-            // Otherwise, `watch_pool` will attempt to borrow the connection
-            // pool mutably while we're still borrowing it here, causing a
-            // panic.
-            let (sender, receiver) = oneshot::channel();
-            if parked_connection.request_in.send(sender).is_err() {
-                None
-            } else {
-                receiver
-                    .await
-                    .unwrap_or(None)
-            }
-        } else {
-            None
-        }
+    fn remove(&mut self) -> Option<ConnectionRequester> {
+        self.requesters.pop()
     }
 }
 
@@ -118,29 +99,77 @@ struct ParkedConnectionPools {
     kick: Option<oneshot::Sender<()>>,
 }
 
-async fn take_parked_connection(
-    connection_pools: &Rc<RefCell<HashMap<ConnectionKey, ParkedConnectionPool>>>,
+impl ParkedConnectionPools {
+    fn new() -> Self {
+        Self {
+            pools: HashMap::new(),
+            kick: None,
+        }
+    }
+}
+
+fn give_parked_connection(
+    connection_pools: &Rc<RefCell<ParkedConnectionPools>>,
     connection_key: ConnectionKey,
-) -> Option<Box<dyn Stream>> {
-    match connection_pools.borrow_mut().entry(connection_key) {
+    connection: Box<dyn Connection>,
+) {
+    connection_pools.borrow_mut().pools.entry(connection_key)
+        .or_insert_with(ParkedConnectionPool::new)
+        .add(connection);
+    if let Some(kick) = connection_pools.borrow_mut().kick.take() {
+        println!("Kicking monitors");
+        kick.send(()).unwrap_or(());
+    } else {
+        println!("Cannot kick monitors");
+    }
+}
+
+async fn take_parked_connection(
+    connection_pools: &Rc<RefCell<ParkedConnectionPools>>,
+    connection_key: ConnectionKey,
+) -> Option<Box<dyn Connection>> {
+    // Remove connection requester from the pools.
+    let connection_requester = match connection_pools.borrow_mut().pools.entry(connection_key) {
         hash_map::Entry::Occupied(mut entry) => {
-            // TODO: The await here might cause a panic, because
-            // `connection_pools` is still being borrowed mutably while
-            // `remove` waits for the monitor to send back the stream, and in
-            // the mean time `watch_pool` will attempt to borrow
-            // `connection_pools` mutably in order to gather more monitors.
-            let stream = entry.get_mut().remove().await;
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-            stream
+            println!("Found a connection requester");
+            let connection_requester = entry.get_mut().remove();
+            connection_requester
         },
-        hash_map::Entry::Vacant(_) => None,
+        hash_map::Entry::Vacant(_) => {
+            println!("No connection requesters found");
+            None
+        },
+    };
+
+    // Now that the connection requester is removed from the pools,
+    // we can communicate with its monitor safely to try to recycle
+    // the connection it's holding.  We share the pools with the monitor,
+    // so it's not safe to hold a mutable reference when yielding.
+    if let Some(connection_requester) = connection_requester {
+        let (sender, receiver) = oneshot::channel();
+        println!("Requesting connection from monitor");
+        if connection_requester.send(sender).is_err() {
+            println!("Connection was broken");
+            None
+        } else {
+            println!("Waiting for connection");
+            let connection = receiver
+                .await // <-- Make sure we're not holding the pools here!
+                .unwrap_or(None);
+            if connection.is_some() {
+                println!("Got a connection");
+            } else {
+                println!("Got no connection back");
+            }
+            connection
+        }
+    } else {
+        None
     }
 }
 
 async fn process_work_queue(
-    connection_pools: Rc<RefCell<HashMap<ConnectionKey, ParkedConnectionPool>>>,
+    connection_pools: Rc<RefCell<ParkedConnectionPools>>,
     receiver: mpsc::UnboundedReceiver<WorkerMessage>
 ) {
     receiver
@@ -154,9 +183,7 @@ async fn process_work_queue(
                     connection,
                 } => {
                     println!("Placing connection to {:?} in pool", connection_key);
-                    connection_pools.borrow_mut().entry(connection_key)
-                        .or_insert_with(ParkedConnectionPool::new)
-                        .add(connection)
+                    give_parked_connection(&connection_pools, connection_key, connection);
                 },
                 WorkerMessage::TakeConnection{
                     connection_key,
@@ -173,29 +200,60 @@ async fn process_work_queue(
 }
 
 async fn watch_pool(
-    connection_pools: Rc<RefCell<HashMap<ConnectionKey, ParkedConnectionPool>>>,
+    connection_pools: Rc<RefCell<ParkedConnectionPools>>,
 ) {
     let mut monitors = Vec::new();
+    let mut needs_kick = true;
     loop {
         monitors.extend(
-            connection_pools.borrow_mut().iter_mut()
+            connection_pools.borrow_mut().pools.iter_mut()
                 .map(|(_, connection_pool)| {
-                    connection_pool.connections.iter_mut()
-                        .filter_map(|(_, connection)| {
-                            connection.monitor.take()
-                        })
+                    connection_pool.requesters.retain(|requester|
+                        if requester.is_canceled() {
+                            println!("Stream requester canceled");
+                            false
+                        } else {
+                            println!("Stream requester not canceled");
+                            true
+                        }
+                    );
+                    connection_pool.monitors.drain(..)
                 })
                 .flatten()
         );
-        // NOTE: We need to add another future which completes when
-        // any monitor is added to `connection_pools`.  This serves
-        // two purposes: (1) to prevent `select_all` from being called
-        // with no futures, and (2) to wake up this task to collect
-        // more monitors when they are added.
-        let (_, _, new_monitors) = futures::future::select_all(
+        connection_pools.borrow_mut().pools.retain(|_, pool|
+            if pool.requesters.is_empty() {
+                println!("Channel pool empty");
+                false
+            } else {
+                println!("Channel pool not empty");
+                true
+            }
+        );
+        if needs_kick {
+            println!("Setting up to kick");
+            let (sender, receiver) = oneshot::channel();
+            connection_pools.borrow_mut().kick = Some(sender);
+            let kick_future = async {
+                receiver.await.unwrap_or(());
+                true
+            }.boxed();
+            monitors.push(kick_future);
+        } else {
+            println!("Already set up to kick");
+        }
+        println!("Waiting on monitors ({})", monitors.len());
+        let (kicked, _, monitors_left) = futures::future::select_all(
             monitors.into_iter()
         ).await;
-        monitors = new_monitors;
+        needs_kick = if kicked {
+            println!("Monitors added");
+            true
+        } else {
+            println!("Monitor completed");
+            false
+        };
+        monitors = monitors_left;
     }
 }
 
@@ -204,7 +262,7 @@ fn worker(
 ) {
     block_on(async {
         println!("Worker started");
-        let connection_pools = Rc::new(RefCell::new(HashMap::new()));
+        let connection_pools = Rc::new(RefCell::new(ParkedConnectionPools::new()));
         select!(
             () = process_work_queue(connection_pools.clone(), receiver).fuse() => (),
             () = watch_pool(connection_pools.clone()).fuse() => (),
@@ -215,10 +273,10 @@ fn worker(
 
 async fn transact(
     raw_request: Vec<u8>,
-    mut stream: Box<dyn Stream>
-) -> Result<(Response, Box<dyn Stream>), Error> {
+    mut connection: Box<dyn Connection>
+) -> Result<(Response, Box<dyn Connection>), Error> {
     // Send the request to the server.
-    stream.write_all(&raw_request).await
+    connection.write_all(&raw_request).await
         .map_err(Error::UnableToSend)?;
 
     // Receive the response from the server.
@@ -230,7 +288,7 @@ async fn transact(
             left_over + 65536,
             0
         );
-        let received = stream.read(&mut receive_buffer[left_over..]).await
+        let received = connection.read(&mut receive_buffer[left_over..]).await
             .map_err(Error::UnableToReceive)
             .and_then(|received| match received {
                 0 => Err(Error::Disconnected),
@@ -241,27 +299,20 @@ async fn transact(
             .map_err(Error::BadResponse)?;
         receive_buffer.drain(0..response_status.consumed);
         if response_status.status == ResponseParseStatus::Complete {
-            return Ok((response, stream));
+            return Ok((response, connection));
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ConnectionKey {
-    host: String,
-    port: u16,
-    use_tls: bool,
 }
 
 enum WorkerMessage {
     Stop,
     GiveConnection{
         connection_key: ConnectionKey,
-        connection: Box<dyn Stream>,
+        connection: Box<dyn Connection>,
     },
     TakeConnection{
         connection_key: ConnectionKey,
-        return_channel: oneshot::Sender<Option<Box<dyn Stream>>>,
+        return_channel: oneshot::Sender<Option<Box<dyn Connection>>>,
     },
 }
 
@@ -277,7 +328,7 @@ impl HttpClient {
         host: Host,
         port: u16,
         use_tls: bool,
-        stream: Box<dyn Stream>
+        connection: Box<dyn Connection>
     ) where Host: AsRef<str> {
         let host = host.as_ref();
         let connection_key = ConnectionKey{
@@ -287,7 +338,7 @@ impl HttpClient {
         };
         self.work_in.unbounded_send(WorkerMessage::GiveConnection{
             connection_key,
-            connection: stream
+            connection
         }).unwrap_or(());
     }
 
@@ -296,7 +347,7 @@ impl HttpClient {
         host: Host,
         port: u16,
         use_tls: bool
-    ) -> Option<Box<dyn Stream>>
+    ) -> Option<Box<dyn Connection>>
         where Host: AsRef<str>
     {
         let host = host.as_ref();
@@ -311,31 +362,37 @@ impl HttpClient {
             connection_key,
             return_channel: sender
         }).unwrap();
-        receiver.await.unwrap_or(None)
+        let connection = receiver.await.unwrap_or(None);
+        if connection.is_some() {
+            println!("Got a recycled connection");
+        } else {
+            println!("No recycled connection available");
+        }
+        connection
     }
 
-    pub async fn connection<Host>(
+    pub async fn connect<Host>(
         &self,
         host: Host,
         port: u16,
         use_tls: bool,
-    ) -> Result<Box<dyn Stream>, Error>
+    ) -> Result<Box<dyn Connection>, Error>
         where Host: AsRef<str>
     {
         // Check if a connection is already made, and if so, reuse it.
         let host = host.as_ref();
-        if let Some(stream) = self.request_recycled_connection(host, port, use_tls).await {
-            return Ok(stream);
+        if let Some(connection) = self.request_recycled_connection(host, port, use_tls).await {
+            return Ok(connection);
         }
 
         // Connect to the server.
         let address = &format!("{}:{}", host, port);
         println!("Connecting to '{}'...", address);
-        let stream = TcpStream::connect(address).await
+        let connection = TcpStream::connect(address).await
             .map_err(Error::UnableToConnect)?;
         println!(
             "Connected (address: {}).",
-            stream.peer_addr()
+            connection.peer_addr()
                 .map_err(Error::UnableToGetPeerAddress)?
         );
 
@@ -343,12 +400,12 @@ impl HttpClient {
         if use_tls {
             println!("Using TLS.");
             let tls_connector = TlsConnector::default();
-            let tls_stream = tls_connector.connect(host, stream).await
+            let tls_connection = tls_connector.connect(host, connection).await
                 .map_err(Error::TlsHandshake)?;
-            Ok(Box::new(tls_stream))
+            Ok(Box::new(tls_connection))
         } else {
             println!("Not using TLS.");
-            Ok(Box::new(stream))
+            Ok(Box::new(connection))
         }
     }
 
@@ -419,14 +476,14 @@ impl HttpClient {
                 scheme.as_deref(),
                 Some("https") | Some("wss")
             );
-            let stream = self.connection(
+            let connection = self.connect(
                 host,
                 port,
                 use_tls
             ).await?;
-            let (response, stream) = transact(raw_request, stream).await?;
+            let (response, connection) = transact(raw_request, connection).await?;
             if reuse {
-                self.recycle_connection(host, port, use_tls, stream);
+                self.recycle_connection(host, port, use_tls, connection);
             }
             Ok(response)
         } else {

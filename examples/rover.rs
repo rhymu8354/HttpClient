@@ -15,14 +15,14 @@ struct Opts {
 }
 
 async fn fetch<UriStr>(
-    client: &mut HttpClient,
+    client: &HttpClient,
     uri: UriStr,
 )
     where UriStr: AsRef<str>
 {
     let mut request = Request::new();
     request.target = Uri::parse(uri).unwrap();
-    match client.fetch(request, true).await {
+    match client.fetch(request, false).await {
         Err(error) => {
             match error.source() {
                 Some(source) => eprintln!("error: {} ({})", error, source),
@@ -48,9 +48,8 @@ async fn fetch<UriStr>(
 
 async fn main_async() {
     let opts: Opts = Opts::from_args();
-    let mut client = HttpClient::new();
-    fetch(&mut client, &opts.uri).await;
-    fetch(&mut client, &opts.uri).await;
+    let client = HttpClient::new();
+    fetch(&client, &opts.uri).await;
 }
 
 fn main() {
