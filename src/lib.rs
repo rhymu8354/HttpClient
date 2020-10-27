@@ -58,6 +58,13 @@ async fn monitor_connection(
             println!("Received request to recycle connection");
             if let Ok(sender) = sender {
                 println!("Sending connection to requestor");
+                // A failure here means the connection requester gave up
+                // waiting for the connection.  It shouldn't happen since the
+                // requestee should respond quickly, but it's still possible if
+                // the requester is dumb and requested a connection only to
+                // immediately give up.  If that happens, silently discard the
+                // connection, as if we gave it to them only for them to drop
+                // it.
                 sender.send(Some(connection)).unwrap_or(());
             } else {
                 println!("No path back to requestor!");
@@ -118,7 +125,12 @@ fn give_parked_connection(
         .add(connection);
     if let Some(kick) = connection_pools.borrow_mut().kick.take() {
         println!("Kicking monitors");
-        kick.send(()).unwrap_or(());
+        // It shouldn't be possible for the kick to fail, since the kick
+        // receiver isn't dropped until either it receives the kick or
+        // the worker is stopped, and this function is only called
+        // by the worker.  So if it does fail, we want to know about it
+        // since it would mean we have a bug.
+        kick.send(()).unwrap();
     } else {
         println!("Cannot kick monitors");
     }
@@ -148,18 +160,24 @@ async fn take_parked_connection(
     if let Some(connection_requester) = connection_requester {
         let (sender, receiver) = oneshot::channel();
         println!("Requesting connection from monitor");
+        // It's possible for this to fail if the connection was broken and we
+        // managed to take the connection requester from the pools before the
+        // worker got around to it.
         if connection_requester.send(sender).is_err() {
             println!("Connection was broken");
             None
         } else {
             println!("Waiting for connection");
+            // It's possible for this to fail if the connection is broken
+            // while we're waiting for the monitor to receive our request
+            // for the connection.
             let connection = receiver
                 .await // <-- Make sure we're not holding the pools here!
                 .unwrap_or(None);
             if connection.is_some() {
                 println!("Got a connection");
             } else {
-                println!("Got no connection back");
+                println!("Connection was broken");
             }
             connection
         }
@@ -168,7 +186,7 @@ async fn take_parked_connection(
     }
 }
 
-async fn process_work_queue(
+async fn handle_messages(
     connection_pools: Rc<RefCell<ParkedConnectionPools>>,
     receiver: mpsc::UnboundedReceiver<WorkerMessage>
 ) {
@@ -190,6 +208,10 @@ async fn process_work_queue(
                     return_channel,
                 } => {
                     println!("Asked to recycle connection to {:?}", connection_key);
+                    // It's possible for this to fail if the user gave up on a
+                    // transaction before the worker was able to recycle a
+                    // connection for use in sending the request.  If this
+                    // happens, the connection is simply dropped.
                     return_channel.send(
                         take_parked_connection(&connection_pools, connection_key).await
                     ).unwrap_or(());
@@ -199,7 +221,7 @@ async fn process_work_queue(
         }).await
 }
 
-async fn watch_pool(
+async fn monitor_connections(
     connection_pools: Rc<RefCell<ParkedConnectionPools>>,
 ) {
     let mut monitors = Vec::new();
@@ -235,7 +257,12 @@ async fn watch_pool(
             let (sender, receiver) = oneshot::channel();
             connection_pools.borrow_mut().kick = Some(sender);
             let kick_future = async {
-                receiver.await.unwrap_or(());
+                // It shouldn't be possible for this to fail, since once the
+                // kick is set up, it isn't dropped until the kick is sent.
+                // The enclosing method holds a reference to `connection_pools`
+                // which holds the kick.  So if it does fail, we want to know
+                // about it since it would mean we have a bug.
+                receiver.await.unwrap();
                 true
             }.boxed();
             monitors.push(kick_future);
@@ -257,18 +284,16 @@ async fn watch_pool(
     }
 }
 
-fn worker(
+async fn worker(
     receiver: mpsc::UnboundedReceiver<WorkerMessage>
 ) {
-    block_on(async {
-        println!("Worker started");
-        let connection_pools = Rc::new(RefCell::new(ParkedConnectionPools::new()));
-        select!(
-            () = process_work_queue(connection_pools.clone(), receiver).fuse() => (),
-            () = watch_pool(connection_pools.clone()).fuse() => (),
-        );
-        println!("Worker stopping");
-    });
+    println!("Worker started");
+    let connection_pools = Rc::new(RefCell::new(ParkedConnectionPools::new()));
+    select!(
+        () = handle_messages(connection_pools.clone(), receiver).fuse() => (),
+        () = monitor_connections(connection_pools).fuse() => (),
+    );
+    println!("Worker stopping");
 }
 
 async fn transact(
@@ -312,7 +337,7 @@ enum WorkerMessage {
     },
     TakeConnection{
         connection_key: ConnectionKey,
-        return_channel: oneshot::Sender<Option<Box<dyn Connection>>>,
+        return_channel: ConnectionSender,
     },
 }
 
@@ -336,10 +361,14 @@ impl HttpClient {
             port,
             use_tls
         };
+        // It shouldn't be possible for this to fail, since the worker holds
+        // the receiver for this channel, and isn't dropped until the client
+        // itself is dropped.  So if it does fail, we want to know about it
+        // since it would mean we have a bug.
         self.work_in.unbounded_send(WorkerMessage::GiveConnection{
             connection_key,
             connection
-        }).unwrap_or(());
+        }).unwrap();
     }
 
     async fn request_recycled_connection<Host>(
@@ -358,10 +387,16 @@ impl HttpClient {
         };
         let (sender, receiver) = oneshot::channel();
         println!("Trying to recycle connection to {:?}", connection_key);
+        // It shouldn't be possible for this to fail, since the worker holds
+        // the receiver for this channel, and isn't dropped until the client
+        // itself is dropped.  So if it does fail, we want to know about it
+        // since it would mean we have a bug.
         self.work_in.unbounded_send(WorkerMessage::TakeConnection{
             connection_key,
             return_channel: sender
         }).unwrap();
+        // This can fail if the connection is broken before the monitor
+        // receives our request for the connection.
         let connection = receiver.await.unwrap_or(None);
         if connection.is_some() {
             println!("Got a recycled connection");
@@ -495,7 +530,7 @@ impl HttpClient {
         let (sender, receiver) = mpsc::unbounded::<WorkerMessage>();
         Self {
             work_in: sender,
-            worker: Some(thread::spawn(move || worker(receiver))),
+            worker: Some(thread::spawn(|| block_on(worker(receiver)))),
         }
     }
 
@@ -510,8 +545,14 @@ impl Default for HttpClient {
 impl Drop for HttpClient {
     fn drop(&mut self) {
         println!("Sending stop message");
+        // It shouldn't be possible for this to fail, since the worker holds
+        // the receiver for this channel, and we haven't joined or dropped the
+        // worker yet (we will a few lines later).  So if it does fail, we want
+        // to know about it since it would mean we have a bug.
         self.work_in.unbounded_send(WorkerMessage::Stop).unwrap();
         println!("Joining worker thread");
+        // This shouldn't fail unless the worker panics.  If it does, there's
+        // no reason why we shouldn't panic as well.
         self.worker.take().unwrap().join().unwrap();
         println!("Worker thread joined");
     }
