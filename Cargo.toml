@@ -20,8 +20,8 @@ async-std = "1.6"
 async-tls = "0.10"
 async-trait = "0.1"
 futures = "0.3"
-pantry = { path = "../Pantry" }
-rhymuri = { path = "../Uri" }
+pantry = "1.0"
+rhymuri = "1.1"
 rhymuweb = { path = "../Http" }
 thiserror = "1.0"
 
