@@ -57,7 +57,7 @@ async fn monitor_connection(
         sender = receiver.fuse() => {
             println!("Received request to recycle connection");
             if let Ok(sender) = sender {
-                println!("Sending connection to requestor");
+                println!("Sending connection to requester");
                 // A failure here means the connection requester gave up
                 // waiting for the connection.  It shouldn't happen since the
                 // requestee should respond quickly, but it's still possible if
@@ -67,7 +67,7 @@ async fn monitor_connection(
                 // it.
                 sender.send(Some(connection)).unwrap_or(());
             } else {
-                println!("No path back to requestor!");
+                println!("No path back to requester!");
             }
         },
     );
@@ -296,12 +296,14 @@ async fn worker(
     println!("Worker stopping");
 }
 
-async fn transact(
-    raw_request: Vec<u8>,
+async fn transact<RawRequest>(
+    raw_request: RawRequest,
     mut connection: Box<dyn Connection>
-) -> Result<(Response, Box<dyn Connection>), Error> {
+) -> Result<(Response, Box<dyn Connection>), Error>
+    where RawRequest: AsRef<[u8]>
+{
     // Send the request to the server.
-    connection.write_all(&raw_request).await
+    connection.write_all(raw_request.as_ref()).await
         .map_err(Error::UnableToSend)?;
 
     // Receive the response from the server.
@@ -339,6 +341,11 @@ enum WorkerMessage {
         connection_key: ConnectionKey,
         return_channel: ConnectionSender,
     },
+}
+
+pub struct ConnectResults {
+    pub connection: Box<dyn Connection>,
+    pub is_reused: bool,
 }
 
 pub struct HttpClient {
@@ -411,13 +418,16 @@ impl HttpClient {
         host: Host,
         port: u16,
         use_tls: bool,
-    ) -> Result<Box<dyn Connection>, Error>
+    ) -> Result<ConnectResults, Error>
         where Host: AsRef<str>
     {
         // Check if a connection is already made, and if so, reuse it.
         let host = host.as_ref();
         if let Some(connection) = self.request_recycled_connection(host, port, use_tls).await {
-            return Ok(connection);
+            return Ok(ConnectResults{
+                connection,
+                is_reused: true,
+            });
         }
 
         // Connect to the server.
@@ -432,16 +442,19 @@ impl HttpClient {
         );
 
         // Wrap with TLS connector if necessary.
-        if use_tls {
-            println!("Using TLS.");
-            let tls_connector = TlsConnector::default();
-            let tls_connection = tls_connector.connect(host, connection).await
-                .map_err(Error::TlsHandshake)?;
-            Ok(Box::new(tls_connection))
-        } else {
-            println!("Not using TLS.");
-            Ok(Box::new(connection))
-        }
+        Ok(ConnectResults{
+            connection: if use_tls {
+                println!("Using TLS.");
+                let tls_connector = TlsConnector::default();
+                let tls_connection = tls_connector.connect(host, connection).await
+                    .map_err(Error::TlsHandshake)?;
+                Box::new(tls_connection)
+            } else {
+                println!("Not using TLS.");
+                Box::new(connection)
+            },
+            is_reused: false,
+        })
     }
 
     pub async fn fetch<Req>(
@@ -506,21 +519,47 @@ impl HttpClient {
             let raw_request = request.generate()
                 .map_err(Error::BadRequest)?;
 
-            // Connect to the server.
-            let use_tls = matches!(
-                scheme.as_deref(),
-                Some("https") | Some("wss")
-            );
-            let connection = self.connect(
-                host,
-                port,
-                use_tls
-            ).await?;
-            let (response, connection) = transact(raw_request, connection).await?;
-            if reuse {
-                self.recycle_connection(host, port, use_tls, connection);
+            // Attempt to connect to the server, sending the request, and
+            // receiving back a response.  This repeats if the connection is
+            // dropped and it was reused from a previous connection, to avoid
+            // the problem where we lose the race between sending a new request
+            // and the server timing out the connection and closing it.
+            loop {
+                // Obtain a connection to the server.  The connection
+                // might be reused from a previous request.
+                let use_tls = matches!(
+                    scheme.as_deref(),
+                    Some("https") | Some("wss")
+                );
+                let connection_results = self.connect(
+                    host,
+                    port,
+                    use_tls
+                ).await?;
+
+                // Attempt to send the request to the server and receive back a
+                // response.  If we get disconnected and the connection was
+                // reused, we will try again.
+                let (response, connection) = match transact(
+                    &raw_request,
+                    connection_results.connection
+                ).await {
+                    Err(Error::Disconnected) if connection_results.is_reused => {
+                        println!("Reused connection broken; trying again");
+                        continue;
+                    },
+                    Err(error) => Err(error),
+                    Ok(results) => Ok(results),
+                }?;
+
+                // Park the connection for possible reuse.
+                if reuse {
+                    self.recycle_connection(host, port, use_tls, connection);
+                }
+
+                // Return the response received.
+                return Ok(response);
             }
-            Ok(response)
         } else {
             Err(Error::NoTargetAuthority(request.target))
         }
