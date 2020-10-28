@@ -1,41 +1,39 @@
+#![warn(clippy::pedantic)]
+// TODO: Remove this once ready to publish.
+#![allow(clippy::missing_errors_doc)]
+// TODO: Uncomment this once ready to publish.
+//#![warn(missing_docs)]
+
 mod error;
 
 use async_std::net::TcpStream;
 use async_tls::TlsConnector;
+use async_trait::async_trait;
 pub use error::Error;
 use futures::{
     AsyncRead,
     AsyncReadExt,
     AsyncWrite,
     AsyncWriteExt,
-    channel::{
-        mpsc,
-        oneshot,
-    },
-    executor,
-    future,
-    Future,
-    FutureExt,
-    StreamExt,
 };
+use pantry::{Pantry, Perishable};
 use rhymuweb::{
     Response,
     ResponseParseStatus,
     Request,
 };
-use std::{
-    cell::RefCell,
-    collections::{
-        HashMap,
-        hash_map,
-    },
-    pin::Pin,
-    rc::Rc,
-    thread,
-};
 
 pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
+
+#[async_trait]
+impl Perishable for Box<dyn Connection> {
+    async fn perished(&mut self) {
+        let mut buffer = [0; 1];
+        self.read(&mut buffer).await.unwrap_or(0);
+        println!("Connection broken");
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ConnectionKey {
@@ -44,282 +42,13 @@ struct ConnectionKey {
     use_tls: bool,
 }
 
-type ConnectionSender = oneshot::Sender<Option<Box<dyn Connection>>>;
-type ConnectionRequester = oneshot::Sender<ConnectionSender>;
-type ConnectionRequestee = oneshot::Receiver<ConnectionSender>;
-
-async fn monitor_connection(
-    mut connection: Box<dyn Connection>,
-    receiver: ConnectionRequestee,
-) -> bool {
-    println!("Now monitoring parked connection");
-    let mut buffer = [0; 1];
-    futures::select!(
-        _ = connection.read(&mut buffer).fuse() => {
-            println!("Connection broken");
-        },
-        sender = receiver.fuse() => {
-            println!("Received request to recycle connection");
-            if let Ok(sender) = sender {
-                println!("Sending connection to requester");
-                // A failure here means the connection requester gave up
-                // waiting for the connection.  It shouldn't happen since the
-                // requestee should respond quickly, but it's still possible if
-                // the requester is dumb and requested a connection only to
-                // immediately give up.  If that happens, silently discard the
-                // connection, as if we gave it to them only for them to drop
-                // it.
-                sender.send(Some(connection)).unwrap_or(());
-            } else {
-                println!("No path back to requester!");
-            }
-        },
-    );
-    false
-}
-
-struct ParkedConnectionPool {
-    requesters: Vec<ConnectionRequester>,
-    monitors: Vec<Pin<Box<dyn Future<Output=bool>>>>,
-}
-
-impl ParkedConnectionPool {
-    fn add(
-        &mut self,
-        connection: Box<dyn Connection>,
-    ) {
-        let (sender, receiver) = oneshot::channel();
-        self.requesters.push(sender);
-        self.monitors.push(monitor_connection(connection, receiver).boxed());
-    }
-
-    fn new() -> Self {
-        Self {
-            requesters: Vec::new(),
-            monitors: Vec::new(),
-        }
-    }
-
-    fn remove(&mut self) -> Option<ConnectionRequester> {
-        self.requesters.pop()
-    }
-}
-
-struct ParkedConnectionPools {
-    pools: HashMap<ConnectionKey, ParkedConnectionPool>,
-    kick: Option<oneshot::Sender<()>>,
-}
-
-impl ParkedConnectionPools {
-    fn new() -> Self {
-        Self {
-            pools: HashMap::new(),
-            kick: None,
-        }
-    }
-}
-
-fn give_parked_connection(
-    connection_pools: &Rc<RefCell<ParkedConnectionPools>>,
-    connection_key: ConnectionKey,
-    connection: Box<dyn Connection>,
-) {
-    connection_pools.borrow_mut().pools.entry(connection_key)
-        .or_insert_with(ParkedConnectionPool::new)
-        .add(connection);
-    if let Some(kick) = connection_pools.borrow_mut().kick.take() {
-        println!("Kicking monitors");
-        // It shouldn't be possible for the kick to fail, since the kick
-        // receiver isn't dropped until either it receives the kick or
-        // the worker is stopped, and this function is only called
-        // by the worker.  So if it does fail, we want to know about it
-        // since it would mean we have a bug.
-        kick.send(()).unwrap();
-    } else {
-        println!("Cannot kick monitors");
-    }
-}
-
-async fn handle_messages(
-    connection_pools: Rc<RefCell<ParkedConnectionPools>>,
-    receiver: mpsc::UnboundedReceiver<WorkerMessage>
-) {
-    receiver
-        .take_while(|message| future::ready(
-            !matches!(message, WorkerMessage::Stop)
-        ))
-        .for_each(|message| async {
-            match message {
-                WorkerMessage::GiveConnection{
-                    connection_key,
-                    connection,
-                } => {
-                    println!("Placing connection to {:?} in pool", connection_key);
-                    give_parked_connection(&connection_pools, connection_key, connection);
-                },
-                WorkerMessage::TakeConnection{
-                    connection_key,
-                    return_channel,
-                } => {
-                    println!("Asked to recycle connection to {:?}", connection_key);
-                    // It's possible for this to fail if the user gave up on a
-                    // transaction before the worker was able to recycle a
-                    // connection for use in sending the request.  If this
-                    // happens, the connection is simply dropped.
-                    return_channel.send(
-                        take_parked_connection(&connection_pools, connection_key).await
-                    ).unwrap_or(());
-                },
-                WorkerMessage::Stop => unreachable!()
-            }
-        }).await
-}
-
-async fn monitor_connections(
-    connection_pools: Rc<RefCell<ParkedConnectionPools>>,
-) {
-    let mut monitors = Vec::new();
-    let mut needs_kick = true;
-    loop {
-        monitors.extend(
-            connection_pools.borrow_mut().pools.iter_mut()
-                .map(|(_, connection_pool)| {
-                    connection_pool.requesters.retain(|requester|
-                        if requester.is_canceled() {
-                            println!("Stream requester canceled");
-                            false
-                        } else {
-                            println!("Stream requester not canceled");
-                            true
-                        }
-                    );
-                    connection_pool.monitors.drain(..)
-                })
-                .flatten()
-        );
-        connection_pools.borrow_mut().pools.retain(|_, pool|
-            if pool.requesters.is_empty() {
-                println!("Channel pool empty");
-                false
-            } else {
-                println!("Channel pool not empty");
-                true
-            }
-        );
-        if needs_kick {
-            println!("Setting up to kick");
-            let (sender, receiver) = oneshot::channel();
-            connection_pools.borrow_mut().kick = Some(sender);
-            let kick_future = async {
-                // It shouldn't be possible for this to fail, since once the
-                // kick is set up, it isn't dropped until the kick is sent.
-                // The enclosing method holds a reference to `connection_pools`
-                // which holds the kick.  So if it does fail, we want to know
-                // about it since it would mean we have a bug.
-                receiver.await.unwrap();
-                true
-            }.boxed();
-            monitors.push(kick_future);
-        } else {
-            println!("Already set up to kick");
-        }
-        println!("Waiting on monitors ({})", monitors.len());
-        let (kicked, _, monitors_left) = future::select_all(
-            monitors.into_iter()
-        ).await;
-        needs_kick = if kicked {
-            println!("Monitors added");
-            true
-        } else {
-            println!("Monitor completed");
-            false
-        };
-        monitors = monitors_left;
-    }
-}
-
-async fn take_parked_connection(
-    connection_pools: &Rc<RefCell<ParkedConnectionPools>>,
-    connection_key: ConnectionKey,
-) -> Option<Box<dyn Connection>> {
-    // Remove connection requester from the pools.
-    let connection_requester = match connection_pools.borrow_mut().pools.entry(connection_key) {
-        hash_map::Entry::Occupied(mut entry) => {
-            println!("Found a connection requester");
-            let connection_requester = entry.get_mut().remove();
-            connection_requester
-        },
-        hash_map::Entry::Vacant(_) => {
-            println!("No connection requesters found");
-            None
-        },
-    };
-
-    // Now that the connection requester is removed from the pools,
-    // we can communicate with its monitor safely to try to recycle
-    // the connection it's holding.  We share the pools with the monitor,
-    // so it's not safe to hold a mutable reference when yielding.
-    if let Some(connection_requester) = connection_requester {
-        let (sender, receiver) = oneshot::channel();
-        println!("Requesting connection from monitor");
-        // It's possible for this to fail if the connection was broken and we
-        // managed to take the connection requester from the pools before the
-        // worker got around to it.
-        if connection_requester.send(sender).is_err() {
-            println!("Connection was broken");
-            None
-        } else {
-            println!("Waiting for connection");
-            // It's possible for this to fail if the connection is broken
-            // while we're waiting for the monitor to receive our request
-            // for the connection.
-            let connection = receiver
-                .await // <-- Make sure we're not holding the pools here!
-                .unwrap_or(None);
-            if connection.is_some() {
-                println!("Got a connection");
-            } else {
-                println!("Connection was broken");
-            }
-            connection
-        }
-    } else {
-        None
-    }
-}
-
-async fn worker(
-    receiver: mpsc::UnboundedReceiver<WorkerMessage>
-) {
-    println!("Worker started");
-    let connection_pools = Rc::new(RefCell::new(ParkedConnectionPools::new()));
-    futures::select!(
-        () = handle_messages(connection_pools.clone(), receiver).fuse() => (),
-        () = monitor_connections(connection_pools).fuse() => (),
-    );
-    println!("Worker stopping");
-}
-
-enum WorkerMessage {
-    Stop,
-    GiveConnection{
-        connection_key: ConnectionKey,
-        connection: Box<dyn Connection>,
-    },
-    TakeConnection{
-        connection_key: ConnectionKey,
-        return_channel: ConnectionSender,
-    },
-}
-
 pub struct ConnectResults {
     pub connection: Box<dyn Connection>,
     pub is_reused: bool,
 }
 
 pub struct HttpClient {
-    work_in: mpsc::UnboundedSender<WorkerMessage>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    pantry: Pantry<ConnectionKey, Box<dyn Connection>>,
 }
 
 impl HttpClient {
@@ -333,7 +62,7 @@ impl HttpClient {
     {
         // Check if a connection is already made, and if so, reuse it.
         let host = host.as_ref();
-        if let Some(connection) = self.request_recycled_connection(host, port, use_tls).await {
+        if let Some(connection) = self.recycle_connection(host, port, use_tls).await {
             return Ok(ConnectResults{
                 connection,
                 is_reused: true,
@@ -394,7 +123,12 @@ impl HttpClient {
             }
 
             // Set other headers specific to the user agent.
+            //
+            // TODO: Add the "Accept-Encoding" header once we add the
+            // necessary support for decoding these.
+            //
             // request.headers.set_header("Accept-Encoding", "gzip, deflate");
+            //
             if !reuse {
                 request.headers.set_header("Connection", "Close");
             }
@@ -464,7 +198,7 @@ impl HttpClient {
 
                 // Park the connection for possible reuse.
                 if reuse {
-                    self.recycle_connection(host, port, use_tls, connection);
+                    self.store_connection(host, port, use_tls, connection);
                 }
 
                 // Return the response received.
@@ -475,15 +209,31 @@ impl HttpClient {
         }
     }
 
+    #[must_use]
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded::<WorkerMessage>();
         Self {
-            work_in: sender,
-            worker: Some(thread::spawn(|| executor::block_on(worker(receiver)))),
+            pantry: Pantry::new(),
         }
     }
 
-    fn recycle_connection<Host>(
+    async fn recycle_connection<Host>(
+        &self,
+        host: Host,
+        port: u16,
+        use_tls: bool
+    ) -> Option<Box<dyn Connection>>
+        where Host: AsRef<str>
+    {
+        let host = host.as_ref();
+        let connection_key = ConnectionKey{
+            host: String::from(host),
+            port,
+            use_tls
+        };
+        self.pantry.fetch(connection_key).await
+    }
+
+    fn store_connection<Host>(
         &self,
         host: Host,
         port: u16,
@@ -498,49 +248,7 @@ impl HttpClient {
             port,
             use_tls
         };
-        // It shouldn't be possible for this to fail, since the worker holds
-        // the receiver for this channel, and isn't dropped until the client
-        // itself is dropped.  So if it does fail, we want to know about it
-        // since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::GiveConnection{
-            connection_key,
-            connection
-        }).unwrap();
-    }
-
-    async fn request_recycled_connection<Host>(
-        &self,
-        host: Host,
-        port: u16,
-        use_tls: bool
-    ) -> Option<Box<dyn Connection>>
-        where Host: AsRef<str>
-    {
-        let host = host.as_ref();
-        let connection_key = ConnectionKey{
-            host: String::from(host),
-            port,
-            use_tls
-        };
-        let (sender, receiver) = oneshot::channel();
-        println!("Trying to recycle connection to {:?}", connection_key);
-        // It shouldn't be possible for this to fail, since the worker holds
-        // the receiver for this channel, and isn't dropped until the client
-        // itself is dropped.  So if it does fail, we want to know about it
-        // since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::TakeConnection{
-            connection_key,
-            return_channel: sender
-        }).unwrap();
-        // This can fail if the connection is broken before the monitor
-        // receives our request for the connection.
-        let connection = receiver.await.unwrap_or(None);
-        if connection.is_some() {
-            println!("Got a recycled connection");
-        } else {
-            println!("No recycled connection available");
-        }
-        connection
+        self.pantry.store(connection_key, connection);
     }
 
     async fn transact<RawRequest>(
@@ -582,21 +290,5 @@ impl HttpClient {
 impl Default for HttpClient {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for HttpClient {
-    fn drop(&mut self) {
-        println!("Sending stop message");
-        // It shouldn't be possible for this to fail, since the worker holds
-        // the receiver for this channel, and we haven't joined or dropped the
-        // worker yet (we will a few lines later).  So if it does fail, we want
-        // to know about it since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::Stop).unwrap();
-        println!("Joining worker thread");
-        // This shouldn't fail unless the worker panics.  If it does, there's
-        // no reason why we shouldn't panic as well.
-        self.worker.take().unwrap().join().unwrap();
-        println!("Worker thread joined");
     }
 }
