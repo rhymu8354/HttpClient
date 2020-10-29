@@ -27,7 +27,6 @@ use rhymuweb::{
     Request,
 };
 use std::{
-    collections::HashMap,
     io::Read as _,
 };
 
@@ -105,24 +104,19 @@ impl HttpClient {
     }
 
     fn decode_body(response: &mut Response) -> Result<(), Error> {
-        type Decoder = fn(Vec<u8>) -> Result<Vec<u8>, Error>;
-        let decoders = [
-            ("gzip", Self::gzip_decode as Decoder),
-            ("deflate", Self::deflate_decode as Decoder),
-        ].iter()
-            .copied()
-            .collect::<HashMap<_, _>>();
         let mut codings = response.headers.header_tokens("Content-Encoding");
         let mut body = Vec::new();
         std::mem::swap(&mut body, &mut response.body);
         while !codings.is_empty() {
             let coding = codings.pop().unwrap();
-            if let Some(decoder) = decoders.get::<str>(coding.as_ref()) {
-                body = decoder(body)?;
-            } else {
-                codings.push(coding);
-                break;
-            }
+            match coding.as_ref() {
+                "gzip" => body = Self::gzip_decode(body)?,
+                "deflate" => body = Self::deflate_decode(body)?,
+                _ => {
+                    codings.push(coding);
+                    break;
+                },
+            };
         }
         std::mem::swap(&mut body, &mut response.body);
         if codings.is_empty() {
