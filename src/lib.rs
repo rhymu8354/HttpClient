@@ -54,6 +54,19 @@ pub struct ConnectResults {
     pub is_reused: bool,
 }
 
+fn split_at<'a>(
+    composite: &'a str,
+    delimiter: char
+) -> Option<(&'a str, &'a str)> {
+    match composite.find(delimiter) {
+        Some(delimiter) => Some((
+            &composite[..delimiter],
+            &composite[delimiter+1..]
+        )),
+        None => None,
+    }
+}
+
 pub struct HttpClient {
     pantry: Pantry<ConnectionKey, Box<dyn Connection>>,
 }
@@ -256,6 +269,42 @@ impl HttpClient {
         Ok(body)
     }
 
+    fn decode_body_as_text(response: &Response) -> Option<String> {
+        if let Some(content_type) = response.headers.header_value("Content-Type") {
+            let (type_subtype, parameters) = match content_type.find(';') {
+                Some(delimiter) => (
+                    &content_type[..delimiter],
+                    &content_type[delimiter+1..]
+                ),
+                None => (&content_type[..], ""),
+            };
+            if let Some((r#type, _)) = split_at(type_subtype, '/') {
+                if !r#type.eq_ignore_ascii_case("text") {
+                    return None;
+                }
+                if let Some(charset) = parameters.split(';')
+                    .map(str::trim)
+                    .filter_map(|parameter| split_at(parameter, '='))
+                    .find_map(|(name, value)| {
+                        if name.eq_ignore_ascii_case("charset") {
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
+                        return encoding.decode_without_bom_handling_and_without_replacement(
+                            &response.body[..]
+                        )
+                            .map(String::from);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn deflate_decode<B>(body: B) -> Result<Vec<u8>, Error>
         where B: AsRef<[u8]>
     {
@@ -355,6 +404,7 @@ impl Default for HttpClient {
 mod tests {
 
     #![allow(clippy::string_lit_as_bytes)]
+    #![allow(clippy::non_ascii_literal)]
 
     use super::*;
 
@@ -537,4 +587,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn body_to_string_valid_encoding_iso_8859_1() {
+        let mut response = Response::new();
+        response.body = b"Tickets to Hogwarts leaving from Platform 9\xbe are \xa310 each".to_vec();
+        response.headers.set_header("Content-Type", "text/plain; charset=iso-8859-1");
+        assert_eq!(
+            Some("Tickets to Hogwarts leaving from Platform 9¾ are £10 each"),
+            HttpClient::decode_body_as_text(&response).as_deref()
+        );
+    }
+
+    #[test]
+    fn body_to_string_valid_encoding_utf_8() {
+        let mut response = Response::new();
+        response.body = "Tickets to Hogwarts leaving from Platform 9¾ are £10 each".as_bytes().to_vec();
+        response.headers.set_header("Content-Type", "text/plain; charset=utf-8");
+        assert_eq!(
+            Some("Tickets to Hogwarts leaving from Platform 9¾ are £10 each"),
+            HttpClient::decode_body_as_text(&response).as_deref()
+        );
+    }
+
+    #[test]
+    fn body_to_string_invalid_encoding_utf8() {
+        let mut response = Response::new();
+        response.body = b"Tickets to Hogwarts leaving from Platform 9\xbe are \xa310 each".to_vec();
+        response.headers.set_header("Content-Type", "text/plain; charset=utf-8");
+        assert!(HttpClient::decode_body_as_text(&response).is_none());
+    }
 }

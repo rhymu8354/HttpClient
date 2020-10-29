@@ -19,6 +19,7 @@ exclude = [
 async-std = "1.6"
 async-tls = "0.10"
 async-trait = "0.1"
+encoding_rs = "0.8"
 flate2 = "1.0"
 futures = "0.3"
 pantry = "1.0"
