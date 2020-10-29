@@ -22,14 +22,14 @@ async fn fetch<UriStr>(
 {
     let mut request = Request::new();
     request.target = Uri::parse(uri).unwrap();
-    match client.fetch(request, false).await {
+    match client.fetch(request, rhymuweb_client::ConnectionUse::SingleResource).await {
         Err(error) => {
             match error.source() {
                 Some(source) => eprintln!("error: {} ({})", error, source),
                 None => eprintln!("error: {}", error),
             };
         },
-        Ok(response) => {
+        Ok(rhymuweb_client::FetchResults{response, ..}) => {
             println!("Response:");
             println!("{}", "=".repeat(78));
             println!("{} {}", response.status_code, response.reason_phrase);

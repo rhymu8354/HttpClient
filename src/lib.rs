@@ -42,9 +42,43 @@ struct ConnectionKey {
     use_tls: bool,
 }
 
+/// This is used with [`fetch`] to tell the client how the underlying
+/// TCP connection will be used, especially after the currently requested
+/// resource has been successfully fetched.
+///
+/// [`fetch`]: struct.HttpClient.html#method.fetch
+pub enum ConnectionUse {
+    /// Close the connection after retrieving the resource.  When this is used,
+    /// the client adds the header "Connection: close" as specified in [`IETF
+    /// RFC 7230 section
+    /// 6.1`](https://tools.ietf.org/html/rfc7230#section-6.1).
+    SingleResource,
+
+    /// Keep the connection open in case the user wants to fetch another
+    /// resource from the same server.
+    MultipleResources,
+
+    /// Attempt to upgrade the connection for use in a higher-level protocol.
+    Upgrade{
+        /// This is the value to set for the "Upgrade" header in the request.
+        protocol: String,
+    },
+}
+
 pub struct ConnectResults {
     pub connection: Box<dyn Connection>,
     pub is_reused: bool,
+}
+
+/// This holds all the results from fetching a web resource.
+pub struct FetchResults {
+    /// This contains the parts of the HTTP response returned by the server.
+    pub response: Response,
+
+    /// If the connection was upgraded to a higher-level protocol, this will
+    /// hold the underlying transport layer connection, which becomes
+    /// the caller's responsibility.
+    pub connection: Option<Box<dyn Connection>>,
 }
 
 pub struct HttpClient {
@@ -99,8 +133,8 @@ impl HttpClient {
     pub async fn fetch<Req>(
         &self,
         request: Req,
-        reuse: bool,
-    ) -> Result<Response, Error>
+        connection_use: ConnectionUse,
+    ) -> Result<FetchResults, Error>
         where Req: Into<Request>
     {
         let mut request: Request = request.into();
@@ -124,8 +158,14 @@ impl HttpClient {
 
             // Set other headers specific to the user agent.
             request.headers.set_header("Accept-Encoding", "gzip, deflate");
-            if !reuse {
-                request.headers.set_header("Connection", "Close");
+            match &connection_use {
+                ConnectionUse::SingleResource => {
+                    request.headers.set_header("Connection", "Close");
+                },
+                ConnectionUse::MultipleResources => {},
+                ConnectionUse::Upgrade{protocol} => {
+                    request.headers.set_header("Upgrade", protocol);
+                },
             }
 
             // Determine the socket address of the server given
@@ -198,13 +238,25 @@ impl HttpClient {
                 )
                     .map_err(Error::BadResponse)?;
 
-                // Park the connection for possible reuse.
-                if reuse {
-                    self.store_connection(host, port, use_tls, connection);
-                }
+                // Results depend on how we're supposed to use the connection,
+                // and what the response status code was.
+                if let (ConnectionUse::Upgrade{..}, 101) = (&connection_use, &response.status_code) {
+                    return Ok(FetchResults{
+                        response,
+                        connection: Some(connection),
+                    });
+                } else {
+                    // Park the connection for possible reuse.
+                    if let ConnectionUse::MultipleResources = &connection_use {
+                        self.store_connection(host, port, use_tls, connection);
+                    }
 
-                // Return the response received.
-                return Ok(response);
+                    // Return the response received.
+                    return Ok(FetchResults{
+                        response,
+                        connection: None,
+                    });
+                }
             }
         } else {
             Err(Error::NoTargetAuthority(request.target))
