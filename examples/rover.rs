@@ -37,7 +37,10 @@ async fn fetch<UriStr>(
                 println!("{}: {}", header.name, header.value);
             }
             println!();
-            match HttpClient::decode_body_as_text(&response) {
+            match rhymuweb::coding::decode_body_as_text(
+                &response.headers,
+                response.body
+            ) {
                 None => println!("(Body cannot be decoded as text)"),
                 Some(body) => println!("{}", body),
             };
