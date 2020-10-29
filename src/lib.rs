@@ -54,10 +54,10 @@ pub struct ConnectResults {
     pub is_reused: bool,
 }
 
-fn split_at<'a>(
-    composite: &'a str,
+fn split_at(
+    composite: &str,
     delimiter: char
-) -> Option<(&'a str, &'a str)> {
+) -> Option<(&str, &str)> {
     match composite.find(delimiter) {
         Some(delimiter) => Some((
             &composite[..delimiter],
@@ -269,7 +269,8 @@ impl HttpClient {
         Ok(body)
     }
 
-    fn decode_body_as_text(response: &Response) -> Option<String> {
+    #[must_use]
+    pub fn decode_body_as_text(response: &Response) -> Option<String> {
         if let Some(content_type) = response.headers.header_value("Content-Type") {
             let (type_subtype, parameters) = match content_type.find(';') {
                 Some(delimiter) => (
@@ -282,7 +283,7 @@ impl HttpClient {
                 if !r#type.eq_ignore_ascii_case("text") {
                     return None;
                 }
-                if let Some(charset) = parameters.split(';')
+                let charset = parameters.split(';')
                     .map(str::trim)
                     .filter_map(|parameter| split_at(parameter, '='))
                     .find_map(|(name, value)| {
@@ -292,13 +293,12 @@ impl HttpClient {
                             None
                         }
                     })
-                {
-                    if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
-                        return encoding.decode_without_bom_handling_and_without_replacement(
-                            &response.body[..]
-                        )
-                            .map(String::from);
-                    }
+                    .unwrap_or("iso-8859-1");
+                if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
+                    return encoding.decode_without_bom_handling_and_without_replacement(
+                        &response.body[..]
+                    )
+                        .map(String::from);
                 }
             }
         }
@@ -616,4 +616,16 @@ mod tests {
         response.headers.set_header("Content-Type", "text/plain; charset=utf-8");
         assert!(HttpClient::decode_body_as_text(&response).is_none());
     }
+
+    #[test]
+    fn body_to_string_default_encoding_iso_8859_1() {
+        let mut response = Response::new();
+        response.body = b"Tickets to Hogwarts leaving from Platform 9\xbe are \xa310 each".to_vec();
+        response.headers.set_header("Content-Type", "text/plain");
+        assert_eq!(
+            Some("Tickets to Hogwarts leaving from Platform 9¾ are £10 each"),
+            HttpClient::decode_body_as_text(&response).as_deref()
+        );
+    }
+
 }

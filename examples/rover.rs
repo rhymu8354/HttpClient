@@ -33,13 +33,13 @@ async fn fetch<UriStr>(
             println!("Response:");
             println!("{}", "=".repeat(78));
             println!("{} {}", response.status_code, response.reason_phrase);
-            for header in response.headers {
+            for header in &response.headers {
                 println!("{}: {}", header.name, header.value);
             }
             println!();
-            match String::from_utf8(response.body) {
-                Err(_) => println!("(Body cannot be decoded as UTF-8)"),
-                Ok(body) => println!("{}", body),
+            match HttpClient::decode_body_as_text(&response) {
+                None => println!("(Body cannot be decoded as text)"),
+                Some(body) => println!("{}", body),
             };
             println!("{}", "=".repeat(78));
         },
