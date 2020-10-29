@@ -52,7 +52,7 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub async fn connect<Host>(
+    async fn connect<Host>(
         &self,
         host: Host,
         port: u16,
