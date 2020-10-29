@@ -6,6 +6,10 @@ pub enum Error {
     #[error("unable to generate HTTP request")]
     BadRequest(#[source] rhymuweb::Error),
 
+    /// There was an error attempting to decode the body of the response.
+    #[error("unable to decode response body")]
+    BadContentEncoding(#[source] std::io::Error),
+
     /// The raw response received from the server could not be parsed.
     #[error("unable to parse HTTP response")]
     BadResponse(#[source] rhymuweb::Error),

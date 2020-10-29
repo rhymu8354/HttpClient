@@ -10,6 +10,10 @@ use async_std::net::TcpStream;
 use async_tls::TlsConnector;
 use async_trait::async_trait;
 pub use error::Error;
+use flate2::bufread::{
+    DeflateDecoder,
+    GzDecoder,
+};
 use futures::{
     AsyncRead,
     AsyncReadExt,
@@ -21,6 +25,10 @@ use rhymuweb::{
     Response,
     ResponseParseStatus,
     Request,
+};
+use std::{
+    collections::HashMap,
+    io::Read as _,
 };
 
 pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
@@ -96,6 +104,42 @@ impl HttpClient {
         })
     }
 
+    fn decode_body(response: &mut Response) -> Result<(), Error> {
+        type Decoder = fn(Vec<u8>) -> Result<Vec<u8>, Error>;
+        let decoders = [
+            ("gzip", Self::gzip_decode as Decoder),
+            ("deflate", Self::deflate_decode as Decoder),
+        ].iter()
+            .copied()
+            .collect::<HashMap<_, _>>();
+        let mut codings = response.headers.header_tokens("Content-Encoding");
+        let mut body = Vec::new();
+        std::mem::swap(&mut body, &mut response.body);
+        while !codings.is_empty() {
+            let coding = codings.pop().unwrap();
+            if let Some(decoder) = decoders.get::<str>(coding.as_ref()) {
+                body = decoder(body)?;
+            } else {
+                codings.push(coding);
+                break;
+            }
+        }
+        std::mem::swap(&mut body, &mut response.body);
+        if codings.is_empty() {
+            response.headers.remove_header("Content-Encoding");
+        } else {
+            response.headers.set_header(
+                "Content-Encoding",
+                codings.join(", ")
+            );
+        }
+        response.headers.set_header(
+            "Content-Length",
+            response.body.len().to_string()
+        );
+        Ok(())
+    }
+
     pub async fn fetch<Req>(
         &self,
         request: Req,
@@ -123,12 +167,7 @@ impl HttpClient {
             }
 
             // Set other headers specific to the user agent.
-            //
-            // TODO: Add the "Accept-Encoding" header once we add the
-            // necessary support for decoding these.
-            //
-            // request.headers.set_header("Accept-Encoding", "gzip, deflate");
-            //
+            request.headers.set_header("Accept-Encoding", "gzip, deflate");
             if !reuse {
                 request.headers.set_header("Connection", "Close");
             }
@@ -168,13 +207,13 @@ impl HttpClient {
             // dropped and it was reused from a previous connection, to avoid
             // the problem where we lose the race between sending a new request
             // and the server timing out the connection and closing it.
+            let use_tls = matches!(
+                scheme.as_deref(),
+                Some("https") | Some("wss")
+            );
             loop {
                 // Obtain a connection to the server.  The connection
                 // might be reused from a previous request.
-                let use_tls = matches!(
-                    scheme.as_deref(),
-                    Some("https") | Some("wss")
-                );
                 let connection_results = self.connect(
                     host,
                     port,
@@ -184,7 +223,7 @@ impl HttpClient {
                 // Attempt to send the request to the server and receive back a
                 // response.  If we get disconnected and the connection was
                 // reused, we will try again.
-                let (response, connection) = match Self::transact(
+                let (mut response, connection) = match Self::transact(
                     &raw_request,
                     connection_results.connection
                 ).await {
@@ -195,6 +234,9 @@ impl HttpClient {
                     Err(error) => Err(error),
                     Ok(results) => Ok(results),
                 }?;
+
+                // Handle content encodings.
+                Self::decode_body(&mut response)?;
 
                 // Park the connection for possible reuse.
                 if reuse {
@@ -207,6 +249,28 @@ impl HttpClient {
         } else {
             Err(Error::NoTargetAuthority(request.target))
         }
+    }
+
+    fn gzip_decode<B>(body: B) -> Result<Vec<u8>, Error>
+        where B: AsRef<[u8]>
+    {
+        let body = body.as_ref();
+        let mut decoder = GzDecoder::new(body);
+        let mut body = Vec::new();
+        decoder.read_to_end(&mut body)
+            .map_err(Error::BadContentEncoding)?;
+        Ok(body)
+    }
+
+    fn deflate_decode<B>(body: B) -> Result<Vec<u8>, Error>
+        where B: AsRef<[u8]>
+    {
+        let body = body.as_ref();
+        let mut decoder = DeflateDecoder::new(body);
+        let mut body = Vec::new();
+        decoder.read_to_end(&mut body)
+            .map_err(Error::BadContentEncoding)?;
+        Ok(body)
     }
 
     #[must_use]
@@ -291,4 +355,192 @@ impl Default for HttpClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #![allow(clippy::string_lit_as_bytes)]
+
+    use super::*;
+
+    #[test]
+    fn gzip_decode() {
+        let body: &[u8] = &[
+            0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0A, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7,
+            0x51, 0x08, 0xCF, 0x2F, 0xCA, 0x49, 0x51, 0x04,
+            0x00, 0xD0, 0xC3, 0x4A, 0xEC, 0x0D, 0x00, 0x00,
+            0x00,
+        ];
+        let body = HttpClient::gzip_decode(body);
+        assert!(body.is_ok());
+        let body = body.unwrap();
+        assert_eq!("Hello, World!".as_bytes(), body);
+    }
+
+    #[test]
+    fn gzip_decode_empty_input() {
+        let body: &[u8] = &[];
+        let body = HttpClient::gzip_decode(body);
+        assert!(matches!(
+            body,
+            Err(Error::BadContentEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn gzip_decode_junk() {
+        let body: &[u8] = b"Hello, this is certainly not gzipped data!";
+        let body = HttpClient::gzip_decode(body);
+        assert!(matches!(
+            body,
+            Err(Error::BadContentEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn gzip_decode_empty_output() {
+        let body: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x08, 0x2d, 0xac, 0xca, 0x5b,
+            0x00, 0x03, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x74,
+            0x78, 0x74, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let body = HttpClient::gzip_decode(body);
+        assert!(body.is_ok());
+        let body = body.unwrap();
+        assert_eq!("".as_bytes(), body);
+    }
+
+    #[test]
+    fn deflate_decode() {
+        let body: &[u8] = &[
+            0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x08,
+            0xcf, 0x2f, 0xca, 0x49, 0x51, 0x04, 0x00,
+        ];
+        let body = HttpClient::deflate_decode(body);
+        assert!(body.is_ok());
+        let body = body.unwrap();
+        assert_eq!("Hello, World!".as_bytes(), body);
+    }
+
+    #[test]
+    fn deflate_decode_empty_input() {
+        let body: &[u8] = &[];
+        let body = HttpClient::deflate_decode(body);
+        assert!(matches!(
+            body,
+            Err(Error::BadContentEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn deflate_decode_junk() {
+        let body: &[u8] = b"Hello, this is certainly not deflated data!";
+        let body = HttpClient::deflate_decode(body);
+        assert!(matches!(
+            body,
+            Err(Error::BadContentEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn deflate_decode_empty_output() {
+        let body: &[u8] = &[
+            0x03, 0x00,
+        ];
+        let body = HttpClient::deflate_decode(body);
+        assert!(body.is_ok());
+        let body = body.unwrap();
+        assert_eq!("".as_bytes(), body);
+    }
+
+    #[test]
+    fn decode_body_not_encoded() {
+        let mut response = Response::new();
+        response.body = "Hello, World!".into();
+        response.headers.set_header(
+            "Content-Length",
+            response.body.len().to_string()
+        );
+        HttpClient::decode_body(&mut response).unwrap();
+        assert_eq!("Hello, World!".as_bytes(), response.body);
+    }
+
+    #[test]
+    fn decode_body_gzipped() {
+        let mut response = Response::new();
+        std::io::Write::write_all(&mut response.body, &[
+            0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0A, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7,
+            0x51, 0x08, 0xCF, 0x2F, 0xCA, 0x49, 0x51, 0x04,
+            0x00, 0xD0, 0xC3, 0x4A, 0xEC, 0x0D, 0x00, 0x00,
+            0x00,
+        ]).unwrap();
+        response.headers.set_header(
+            "Content-Length",
+            response.body.len().to_string()
+        );
+        response.headers.set_header("Content-Encoding", "gzip");
+        HttpClient::decode_body(&mut response).unwrap();
+        assert_eq!("Hello, World!".as_bytes(), response.body);
+        assert_eq!(
+            response.body.len().to_string(),
+            response.headers.header_value("Content-Length").unwrap()
+        );
+        assert!(!response.headers.has_header("Content-Encoding"));
+    }
+
+    #[test]
+    fn decode_body_deflated_then_gzipped() {
+        let mut response = Response::new();
+        std::io::Write::write_all(&mut response.body, &[
+            0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xFF, 0xFB, 0xEC, 0x71, 0xF6, 0xE4, 0xC9,
+            0xEB, 0x81, 0x1C, 0xE7, 0xF5, 0x4F, 0x79, 0x06,
+            0xB2, 0x30, 0x00, 0x00, 0x87, 0x6A, 0xB2, 0x3A,
+            0x0F, 0x00, 0x00, 0x00,
+        ]).unwrap();
+        response.headers.set_header(
+            "Content-Length",
+            response.body.len().to_string()
+        );
+        response.headers.set_header("Content-Encoding", "deflate, gzip");
+        HttpClient::decode_body(&mut response).unwrap();
+        assert_eq!("Hello, World!".as_bytes(), response.body);
+        assert_eq!(
+            response.body.len().to_string(),
+            response.headers.header_value("Content-Length").unwrap()
+        );
+        assert!(!response.headers.has_header("Content-Encoding"));
+    }
+
+    #[test]
+    fn decode_body_unknown_coding_then_gzipped() {
+        let mut response = Response::new();
+        std::io::Write::write_all(&mut response.body, &[
+            0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0A, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7,
+            0x51, 0x08, 0xCF, 0x2F, 0xCA, 0x49, 0x51, 0x04,
+            0x00, 0xD0, 0xC3, 0x4A, 0xEC, 0x0D, 0x00, 0x00,
+            0x00,
+        ]).unwrap();
+        response.headers.set_header(
+            "Content-Length",
+            response.body.len().to_string()
+        );
+        response.headers.set_header("Content-Encoding", "foobar, gzip");
+        HttpClient::decode_body(&mut response).unwrap();
+        assert_eq!("Hello, World!".as_bytes(), response.body);
+        assert_eq!(
+            response.body.len().to_string(),
+            response.headers.header_value("Content-Length").unwrap()
+        );
+        assert_eq!(
+            Some("foobar"),
+            response.headers.header_value("Content-Encoding").as_deref()
+        );
+    }
+
 }
