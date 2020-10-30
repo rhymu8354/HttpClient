@@ -8,12 +8,7 @@ license = "MIT"
 readme = "README.md"
 categories = ["web-programming"]
 keywords = ["http", "client"]
-repository = "https://github.com/rhymu8354/WebClient.git"
-exclude = [
-    "*.hpp",
-    "*.cpp",
-    "CMakeLists.txt"
-]
+repository = "https://github.com/rhymu8354/HttpClient.git"
 
 [dependencies]
 async-std = "1.6"
