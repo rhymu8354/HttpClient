@@ -1,6 +1,8 @@
 use async_ctrlc::CtrlC;
-use futures::select;
-use futures::future::FutureExt;
+use futures::{
+    future::FutureExt,
+    select,
+};
 use rhymuri::Uri;
 use rhymuweb::Request;
 use rhymuweb_client::HttpClient;
@@ -10,26 +12,32 @@ use structopt::StructOpt;
 #[derive(Clone, StructOpt)]
 struct Opts {
     /// URI of resource to request
-    #[structopt(default_value="http://buddy.local:8080/")]
+    #[structopt(default_value = "http://buddy.local:8080/")]
     uri: String,
 }
 
 async fn fetch<UriStr>(
     client: &HttpClient,
     uri: UriStr,
-)
-    where UriStr: AsRef<str>
+) where
+    UriStr: AsRef<str>,
 {
     let mut request = Request::new();
     request.target = Uri::parse(uri).unwrap();
-    match client.fetch(request, rhymuweb_client::ConnectionUse::SingleResource).await {
+    match client
+        .fetch(request, rhymuweb_client::ConnectionUse::SingleResource)
+        .await
+    {
         Err(error) => {
             match error.source() {
                 Some(source) => eprintln!("error: {} ({})", error, source),
                 None => eprintln!("error: {}", error),
             };
         },
-        Ok(rhymuweb_client::FetchResults{response, ..}) => {
+        Ok(rhymuweb_client::FetchResults {
+            response,
+            ..
+        }) => {
             println!("Response:");
             println!("{}", "=".repeat(78));
             println!("{} {}", response.status_code, response.reason_phrase);
@@ -39,7 +47,7 @@ async fn fetch<UriStr>(
             println!();
             match rhymuweb::coding::decode_body_as_text(
                 &response.headers,
-                response.body
+                response.body,
             ) {
                 None => println!("(Body cannot be decoded as text)"),
                 Some(body) => println!("{}", body),

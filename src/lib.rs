@@ -16,11 +16,14 @@ use futures::{
     AsyncWrite,
     AsyncWriteExt,
 };
-use pantry::{Pantry, Perishable};
+use pantry::{
+    Pantry,
+    Perishable,
+};
 use rhymuweb::{
+    Request,
     Response,
     ResponseParseStatus,
-    Request,
 };
 
 pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
@@ -59,7 +62,7 @@ pub enum ConnectionUse {
     MultipleResources,
 
     /// Attempt to upgrade the connection for use in a higher-level protocol.
-    Upgrade{
+    Upgrade {
         /// This is the value to set for the "Upgrade" header in the request.
         protocol: String,
     },
@@ -92,12 +95,15 @@ impl HttpClient {
         port: u16,
         use_tls: bool,
     ) -> Result<ConnectResults, Error>
-        where Host: AsRef<str>
+    where
+        Host: AsRef<str>,
     {
         // Check if a connection is already made, and if so, reuse it.
         let host = host.as_ref();
-        if let Some(connection) = self.recycle_connection(host, port, use_tls).await {
-            return Ok(ConnectResults{
+        if let Some(connection) =
+            self.recycle_connection(host, port, use_tls).await
+        {
+            return Ok(ConnectResults {
                 connection,
                 is_reused: true,
             });
@@ -106,20 +112,22 @@ impl HttpClient {
         // Connect to the server.
         let address = &format!("{}:{}", host, port);
         println!("Connecting to '{}'...", address);
-        let connection = TcpStream::connect(address).await
+        let connection = TcpStream::connect(address)
+            .await
             .map_err(Error::UnableToConnect)?;
         println!(
             "Connected (address: {}).",
-            connection.peer_addr()
-                .map_err(Error::UnableToGetPeerAddress)?
+            connection.peer_addr().map_err(Error::UnableToGetPeerAddress)?
         );
 
         // Wrap with TLS connector if necessary.
-        Ok(ConnectResults{
+        Ok(ConnectResults {
             connection: if use_tls {
                 println!("Using TLS.");
                 let tls_connector = TlsConnector::default();
-                let tls_connection = tls_connector.connect(host, connection).await
+                let tls_connection = tls_connector
+                    .connect(host, connection)
+                    .await
                     .map_err(Error::TlsHandshake)?;
                 Box::new(tls_connection)
             } else {
@@ -135,7 +143,8 @@ impl HttpClient {
         request: Req,
         connection_use: ConnectionUse,
     ) -> Result<FetchResults, Error>
-        where Req: Into<Request>
+    where
+        Req: Into<Request>,
     {
         let mut request: Request = request.into();
         if let Some(authority) = request.target.take_authority() {
@@ -144,15 +153,16 @@ impl HttpClient {
 
             // Determine the server hostname and include it in the request
             // headers.
-            let host = std::str::from_utf8(authority.host())
-                .map_err(|_| Error::HostNotValidText(authority.host().to_vec()))?;
+            let host = std::str::from_utf8(authority.host()).map_err(|_| {
+                Error::HostNotValidText(authority.host().to_vec())
+            })?;
             request.headers.set_header("Host", host);
 
             // Store the body size in the request headers.
             if !request.body.is_empty() {
                 request.headers.set_header(
                     "Content-Length",
-                    request.body.len().to_string()
+                    request.body.len().to_string(),
                 );
             }
 
@@ -163,24 +173,25 @@ impl HttpClient {
                     request.headers.set_header("Connection", "Close");
                 },
                 ConnectionUse::MultipleResources => {},
-                ConnectionUse::Upgrade{protocol} => {
+                ConnectionUse::Upgrade {
+                    protocol,
+                } => {
                     request.headers.set_header("Upgrade", protocol);
                 },
             }
 
             // Determine the socket address of the server given
             // the hostname and port number.
-            let port = authority.port()
-                .or_else(
-                    || match scheme.as_deref() {
-                        Some("http") | Some("ws") => Some(80),
-                        Some("https") | Some("wss") => Some(443),
-                        _ => None,
-                    }
-                )
-                .ok_or_else(
-                    || Error::UnableToDetermineServerPort(request.target.clone())
-                )?;
+            let port = authority
+                .port()
+                .or_else(|| match scheme.as_deref() {
+                    Some("http") | Some("ws") => Some(80),
+                    Some("https") | Some("wss") => Some(443),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::UnableToDetermineServerPort(request.target.clone())
+                })?;
 
             // Generate the raw request byte stream.
             println!("Request:");
@@ -195,38 +206,36 @@ impl HttpClient {
                 Ok(body) => println!("{}", body),
             };
             println!("{}", "=".repeat(78));
-            let raw_request = request.generate()
-                .map_err(Error::BadRequest)?;
+            let raw_request = request.generate().map_err(Error::BadRequest)?;
 
             // Attempt to connect to the server, sending the request, and
             // receiving back a response.  This repeats if the connection is
             // dropped and it was reused from a previous connection, to avoid
             // the problem where we lose the race between sending a new request
             // and the server timing out the connection and closing it.
-            let use_tls = matches!(
-                scheme.as_deref(),
-                Some("https") | Some("wss")
-            );
+            let use_tls =
+                matches!(scheme.as_deref(), Some("https") | Some("wss"));
             loop {
                 // Obtain a connection to the server.  The connection
                 // might be reused from a previous request.
-                let connection_results = self.connect(
-                    host,
-                    port,
-                    use_tls
-                ).await?;
+                let connection_results =
+                    self.connect(host, port, use_tls).await?;
 
                 // Attempt to send the request to the server and receive back a
                 // response.  If we get disconnected and the connection was
                 // reused, we will try again.
                 let (mut response, connection) = match Self::transact(
                     &raw_request,
-                    connection_results.connection
-                ).await {
-                    Err(Error::Disconnected) if connection_results.is_reused => {
+                    connection_results.connection,
+                )
+                .await
+                {
+                    Err(Error::Disconnected)
+                        if connection_results.is_reused =>
+                    {
                         println!("Reused connection broken; trying again");
                         continue;
-                    },
+                    }
                     Err(error) => Err(error),
                     Ok(results) => Ok(results),
                 }?;
@@ -234,14 +243,20 @@ impl HttpClient {
                 // Handle content encodings.
                 response.body = rhymuweb::coding::decode_body(
                     &mut response.headers,
-                    response.body
+                    response.body,
                 )
-                    .map_err(Error::BadResponse)?;
+                .map_err(Error::BadResponse)?;
 
                 // Results depend on how we're supposed to use the connection,
                 // and what the response status code was.
-                if let (ConnectionUse::Upgrade{..}, 101) = (&connection_use, &response.status_code) {
-                    return Ok(FetchResults{
+                if let (
+                    ConnectionUse::Upgrade {
+                        ..
+                    },
+                    101,
+                ) = (&connection_use, &response.status_code)
+                {
+                    return Ok(FetchResults {
                         response,
                         connection: Some(connection),
                     });
@@ -252,7 +267,7 @@ impl HttpClient {
                     }
 
                     // Return the response received.
-                    return Ok(FetchResults{
+                    return Ok(FetchResults {
                         response,
                         connection: None,
                     });
@@ -274,15 +289,16 @@ impl HttpClient {
         &self,
         host: Host,
         port: u16,
-        use_tls: bool
+        use_tls: bool,
     ) -> Option<Box<dyn Connection>>
-        where Host: AsRef<str>
+    where
+        Host: AsRef<str>,
     {
         let host = host.as_ref();
-        let connection_key = ConnectionKey{
+        let connection_key = ConnectionKey {
             host: String::from(host),
             port,
-            use_tls
+            use_tls,
         };
         self.pantry.fetch(connection_key).await
     }
@@ -292,27 +308,30 @@ impl HttpClient {
         host: Host,
         port: u16,
         use_tls: bool,
-        connection: Box<dyn Connection>
-    )
-        where Host: AsRef<str>
+        connection: Box<dyn Connection>,
+    ) where
+        Host: AsRef<str>,
     {
         let host = host.as_ref();
-        let connection_key = ConnectionKey{
+        let connection_key = ConnectionKey {
             host: String::from(host),
             port,
-            use_tls
+            use_tls,
         };
         self.pantry.store(connection_key, connection);
     }
 
     async fn transact<RawRequest>(
         raw_request: RawRequest,
-        mut connection: Box<dyn Connection>
+        mut connection: Box<dyn Connection>,
     ) -> Result<(Response, Box<dyn Connection>), Error>
-        where RawRequest: AsRef<[u8]>
+    where
+        RawRequest: AsRef<[u8]>,
     {
         // Send the request to the server.
-        connection.write_all(raw_request.as_ref()).await
+        connection
+            .write_all(raw_request.as_ref())
+            .await
             .map_err(Error::UnableToSend)?;
 
         // Receive the response from the server.
@@ -320,18 +339,18 @@ impl HttpClient {
         let mut receive_buffer = Vec::new();
         loop {
             let left_over = receive_buffer.len();
-            receive_buffer.resize(
-                left_over + 65536,
-                0
-            );
-            let received = connection.read(&mut receive_buffer[left_over..]).await
+            receive_buffer.resize(left_over + 65536, 0);
+            let received = connection
+                .read(&mut receive_buffer[left_over..])
+                .await
                 .map_err(Error::UnableToReceive)
                 .and_then(|received| match received {
                     0 => Err(Error::Disconnected),
                     received => Ok(received),
                 })?;
             receive_buffer.truncate(left_over + received);
-            let response_status = response.parse(&mut receive_buffer)
+            let response_status = response
+                .parse(&mut receive_buffer)
                 .map_err(Error::BadResponse)?;
             receive_buffer.drain(0..response_status.consumed);
             if response_status.status == ResponseParseStatus::Complete {
