@@ -2,7 +2,8 @@
 /// crate generates.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The raw request to be sent to the server could not be generated.
+    /// The raw request to be sent to the server could not be turned into a
+    /// valid byte stream.
     #[error("unable to generate HTTP request")]
     BadRequest(#[source] rhymuweb::Error),
 
