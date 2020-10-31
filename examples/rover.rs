@@ -19,15 +19,13 @@ struct Opts {
 async fn fetch<UriStr>(
     client: &HttpClient,
     uri: UriStr,
+    connection_use: rhymuweb_client::ConnectionUse,
 ) where
     UriStr: AsRef<str>,
 {
     let mut request = Request::new();
     request.target = Uri::parse(uri).unwrap();
-    match client
-        .fetch(request, rhymuweb_client::ConnectionUse::SingleResource)
-        .await
-    {
+    match client.fetch(request, connection_use).await {
         Err(error) => {
             match error.source() {
                 Some(source) => eprintln!("error: {} ({})", error, source),
@@ -60,7 +58,14 @@ async fn fetch<UriStr>(
 async fn main_async() {
     let opts: Opts = Opts::from_args();
     let client = HttpClient::new();
-    fetch(&client, &opts.uri).await;
+    fetch(
+        &client,
+        &opts.uri,
+        rhymuweb_client::ConnectionUse::MultipleResources,
+    )
+    .await;
+    fetch(&client, &opts.uri, rhymuweb_client::ConnectionUse::SingleResource)
+        .await;
 }
 
 fn main() {
