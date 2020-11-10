@@ -60,6 +60,7 @@ use rhymuweb::{
     Response,
     ResponseParseStatus,
 };
+use std::fmt::Write;
 
 /// This is a collection of traits which the connections established by
 /// [`HttpClient`] implement.
@@ -112,15 +113,26 @@ struct ConnectResults {
     is_reused: bool,
 }
 
+/// This holds information to provide to a higher-level protocol in the case
+/// where an HTTP connection is upgraded after a response.
+pub struct ConnectionUpgrade {
+    /// This holds the underlying transport layer connection, which becomes the
+    /// caller's responsibility.
+    pub connection: Box<dyn Connection>,
+
+    /// This holds any extra bytes received by the client after the end
+    /// of the upgrade response.
+    pub trailer: Vec<u8>,
+}
+
 /// This holds all the results from fetching a web resource.
 pub struct FetchResults {
     /// This contains the parts of the HTTP response returned by the server.
     pub response: Response,
 
-    /// If the connection was upgraded to a higher-level protocol, this will
-    /// hold the underlying transport layer connection, which becomes
-    /// the caller's responsibility.
-    pub connection: Option<Box<dyn Connection>>,
+    /// If the connection was upgraded to a higher-level protocol, this
+    /// contains all the information to provide to that protocol.
+    pub upgrade: Option<ConnectionUpgrade>,
 }
 
 /// This type is used to fetch resources from web servers using the Hypertext
@@ -236,6 +248,8 @@ impl HttpClient {
     /// [`Error::UnableToSend`]: enum.Error.html#variant.UnableToSend
     /// [`Error::UnableToReceive`]: enum.Error.html#variant.UnableToReceive
     /// [`Error::BadResponse`]: enum.Error.html#variant.BadResponse
+    // TODO: Refactor this
+    #[allow(clippy::too_many_lines)]
     pub async fn fetch<Req>(
         &self,
         request: Req,
@@ -249,12 +263,37 @@ impl HttpClient {
             // Remove scheme from the target.
             let scheme = request.target.take_scheme();
 
+            // Determine the socket address of the server given
+            // the hostname and port number.
+            let port = authority
+                .port()
+                .or_else(|| match scheme.as_deref() {
+                    Some("http") | Some("ws") => Some(80),
+                    Some("https") | Some("wss") => Some(443),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::UnableToDetermineServerPort(request.target.clone())
+                })?;
+
             // Determine the server hostname and include it in the request
-            // headers.
+            // headers.  If we are connecting on a non-standard port,
+            // include the port number as well.
             let host = std::str::from_utf8(authority.host()).map_err(|_| {
                 Error::HostNotValidText(authority.host().to_vec())
             })?;
-            request.headers.set_header("Host", host);
+            let mut host_header_value = String::from(host);
+            if match (scheme.as_deref(), port) {
+                (Some("http"), 80)
+                | (Some("ws"), 80)
+                | (Some("https"), 443)
+                | (Some("wss"), 443) => false,
+                (_, _) => true,
+            } {
+                write!(host_header_value, ":{}", port)
+                    .expect("unable to append port number to hostname");
+            }
+            request.headers.set_header("Host", host_header_value);
 
             // Store the body size in the request headers.
             if !request.body.is_empty() {
@@ -278,19 +317,6 @@ impl HttpClient {
                     request.headers.set_header("Upgrade", protocol);
                 },
             }
-
-            // Determine the socket address of the server given
-            // the hostname and port number.
-            let port = authority
-                .port()
-                .or_else(|| match scheme.as_deref() {
-                    Some("http") | Some("ws") => Some(80),
-                    Some("https") | Some("wss") => Some(443),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::UnableToDetermineServerPort(request.target.clone())
-                })?;
 
             // Generate the raw request byte stream.
             println!("Request:");
@@ -323,7 +349,7 @@ impl HttpClient {
                 // Attempt to send the request to the server and receive back a
                 // response.  If we get disconnected and the connection was
                 // reused, we will try again.
-                let (mut response, connection) = match Self::transact(
+                let (mut response, connection, trailer) = match Self::transact(
                     &raw_request,
                     connection_results.connection,
                 )
@@ -357,7 +383,10 @@ impl HttpClient {
                 {
                     return Ok(FetchResults {
                         response,
-                        connection: Some(connection),
+                        upgrade: Some(ConnectionUpgrade {
+                            connection,
+                            trailer,
+                        }),
                     });
                 } else {
                     // Park the connection for possible reuse.
@@ -368,7 +397,7 @@ impl HttpClient {
                     // Return the response received.
                     return Ok(FetchResults {
                         response,
-                        connection: None,
+                        upgrade: None,
                     });
                 }
             }
@@ -425,7 +454,7 @@ impl HttpClient {
     async fn transact<RawRequest>(
         raw_request: RawRequest,
         mut connection: Box<dyn Connection>,
-    ) -> Result<(Response, Box<dyn Connection>), Error>
+    ) -> Result<(Response, Box<dyn Connection>, Vec<u8>), Error>
     where
         RawRequest: AsRef<[u8]>,
     {
@@ -454,8 +483,17 @@ impl HttpClient {
                 .parse(&mut receive_buffer)
                 .map_err(Error::BadResponse)?;
             receive_buffer.drain(0..response_status.consumed);
+            let status_code = response.status_code;
             if response_status.status == ResponseParseStatus::Complete {
-                return Ok((response, connection));
+                return Ok((
+                    response,
+                    connection,
+                    if status_code == 101 {
+                        receive_buffer
+                    } else {
+                        Vec::new()
+                    },
+                ));
             }
         }
     }
