@@ -274,6 +274,7 @@ impl HttpClient {
                 ConnectionUse::Upgrade {
                     protocol,
                 } => {
+                    request.headers.set_header("Connection", "upgrade");
                     request.headers.set_header("Upgrade", protocol);
                 },
             }
