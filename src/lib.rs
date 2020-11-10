@@ -74,7 +74,6 @@ impl Perishable for Box<dyn Connection> {
     async fn perished(&mut self) {
         let mut buffer = [0; 1];
         self.read(&mut buffer).await.unwrap_or(0);
-        println!("Connection broken");
     }
 }
 
@@ -165,19 +164,13 @@ impl HttpClient {
 
         // Connect to the server.
         let address = &format!("{}:{}", host, port);
-        println!("Connecting to '{}'...", address);
         let connection = TcpStream::connect(address)
             .await
             .map_err(Error::UnableToConnect)?;
-        println!(
-            "Connected (address: {}).",
-            connection.peer_addr().map_err(Error::UnableToGetPeerAddress)?
-        );
 
         // Wrap with TLS connector if necessary.
         Ok(ConnectResults {
             connection: if use_tls {
-                println!("Using TLS.");
                 let tls_connector = TlsConnector::default();
                 let tls_connection = tls_connector
                     .connect(host, connection)
@@ -185,7 +178,6 @@ impl HttpClient {
                     .map_err(Error::TlsHandshake)?;
                 Box::new(tls_connection)
             } else {
-                println!("Not using TLS.");
                 Box::new(connection)
             },
             is_reused: false,
@@ -216,9 +208,6 @@ impl HttpClient {
     ///   a byte stream to be sent to the web server.
     /// * [`Error::UnableToConnect`] &ndash; a connection to the web server
     ///   could not be established.
-    /// * [`Error::UnableToGetPeerAddress`] &ndash; a connection to the web
-    ///   server was established, but the server's remote address could not be
-    ///   determined.
     /// * [`Error::TlsHandshake`] &ndash; a connection to the web server was
     ///   established, but the connection could not be secured using Transport
     ///   Layer Security (TLS).
@@ -241,8 +230,6 @@ impl HttpClient {
     /// enum.Error.html#variant.UnableToDetermineServerPort
     /// [`Error::BadRequest`]: enum.Error.html#variant.BadRequest
     /// [`Error::UnableToConnect`]: enum.Error.html#variant.UnableToConnect
-    /// [`Error::UnableToGetPeerAddress`]:
-    /// enum.Error.html#variant.UnableToGetPeerAddress
     /// [`Error::TlsHandshake`]: enum.Error.html#variant.TlsHandshake
     /// [`Error::Disconnected`]: enum.Error.html#variant.Disconnected
     /// [`Error::UnableToSend`]: enum.Error.html#variant.UnableToSend
@@ -319,18 +306,6 @@ impl HttpClient {
             }
 
             // Generate the raw request byte stream.
-            println!("Request:");
-            println!("{}", "=".repeat(78));
-            println!("{} {}", request.method, request.target);
-            for header in &request.headers {
-                println!("{}: {}", header.name, header.value);
-            }
-            println!();
-            match String::from_utf8(request.body.clone()) {
-                Err(_) => println!("(Body cannot be decoded as UTF-8)"),
-                Ok(body) => println!("{}", body),
-            };
-            println!("{}", "=".repeat(78));
             let raw_request = request.generate().map_err(Error::BadRequest)?;
 
             // Attempt to connect to the server, sending the request, and
@@ -358,7 +333,6 @@ impl HttpClient {
                     Err(Error::Disconnected)
                         if connection_results.is_reused =>
                     {
-                        println!("Reused connection broken; trying again");
                         continue;
                     }
                     Err(error) => Err(error),

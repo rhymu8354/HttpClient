@@ -39,11 +39,6 @@ pub enum Error {
     #[error("unable to determine target server port from URI")]
     UnableToDetermineServerPort(rhymuri::Uri),
 
-    /// The user agent connected to a server but could not get the
-    /// server's address from the connection.
-    #[error("unable to get peer address from connection")]
-    UnableToGetPeerAddress(#[source] std::io::Error),
-
     /// The user agent encountered an error attempting to receive the
     /// response from the server.
     #[error("unable to receive response from server")]
