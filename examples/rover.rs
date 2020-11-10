@@ -58,12 +58,6 @@ async fn fetch<UriStr>(
 async fn main_async() {
     let opts: Opts = Opts::from_args();
     let client = HttpClient::new();
-    fetch(
-        &client,
-        &opts.uri,
-        rhymuweb_client::ConnectionUse::MultipleResources,
-    )
-    .await;
     fetch(&client, &opts.uri, rhymuweb_client::ConnectionUse::SingleResource)
         .await;
 }
