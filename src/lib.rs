@@ -1,8 +1,43 @@
+//! This crate provides the [`HttpClient`] type, which can be used to send
+//! Hypertext Transfer Protocol (HTTP) 1.1 requests to web servers and receive
+//! back responses from them.  Support is also included to upgrade connections
+//! to higher-level protocols such as [`WebSockets`], as long as the user takes
+//! care of including any required headers and/or body for the request.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! # extern crate futures;
+//! # extern crate rhymessage;
+//! # extern crate rhymuri;
+//! # extern crate rhymuweb;
+//! use futures::executor;
+//! use rhymuri::Uri;
+//! use rhymuweb::Request;
+//! use rhymuweb_client::{
+//!     ConnectionUse,
+//!     HttpClient,
+//! };
+//!
+//! # fn main() -> Result<(), rhymessage::Error> {
+//! let client = HttpClient::new();
+//! let mut request = Request::new();
+//! request.target = Uri::parse("http://www.example.com/foo?bar").unwrap();
+//! let response = executor::block_on(async {
+//!     client.fetch(request, ConnectionUse::SingleResource).await
+//! })
+//! .unwrap()
+//! .response;
+//! assert_eq!(200, response.status_code);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`HttpClient`]: struct.HttpClient.html
+//! [`WebSockets`]: https://tools.ietf.org/html/rfc6455
+
 #![warn(clippy::pedantic)]
-// TODO: Remove this once ready to publish.
-#![allow(clippy::missing_errors_doc)]
-// TODO: Uncomment this once ready to publish.
-//#![warn(missing_docs)]
+#![warn(missing_docs)]
 
 mod error;
 
@@ -26,8 +61,12 @@ use rhymuweb::{
     ResponseParseStatus,
 };
 
-pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
+/// This is a collection of traits which the connections established by
+/// [`HttpClient`] implement.
+///
+/// [`HttpClient`]: struct.HttpClient.html
+pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
 
 #[async_trait]
 impl Perishable for Box<dyn Connection> {
@@ -68,9 +107,9 @@ pub enum ConnectionUse {
     },
 }
 
-pub struct ConnectResults {
-    pub connection: Box<dyn Connection>,
-    pub is_reused: bool,
+struct ConnectResults {
+    connection: Box<dyn Connection>,
+    is_reused: bool,
 }
 
 /// This holds all the results from fetching a web resource.
@@ -84,6 +123,9 @@ pub struct FetchResults {
     pub connection: Option<Box<dyn Connection>>,
 }
 
+/// This type is used to fetch resources from web servers using the Hypertext
+/// Transfer Protocol (HTTP) 1.1.  Use the [`fetch`] asynchronous function to
+/// send a request and obtain a response.
 pub struct HttpClient {
     pantry: Pantry<ConnectionKey, Box<dyn Connection>>,
 }
@@ -138,6 +180,62 @@ impl HttpClient {
         })
     }
 
+    /// Send the given HTTP request and obtain a response from the web server
+    /// identified in the request.  Make sure to fill the request with the
+    /// correct URI of the resource requested, and provide any necessary
+    /// headers (other than `Host`, `Connection`, and `Content-Length`, which
+    /// are set automatically by the client).
+    ///
+    /// Connections to web servers may be reused for multiple connections if
+    /// [`ConnectionUse::MultipleResources`] is specified.  Specifying
+    /// [`ConnectionUse::Upgrade`] instead will request that the connection be
+    /// upgraded to a higher-level protocol after the response is returned.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::HostNotValidText`] &ndash; the host name in authority of the
+    ///   target URI contains bytes which could not be parsed as valid text.
+    /// * [`Error::NoTargetAuthority`] &ndash; no authority was included in the
+    ///   target URI in the request.
+    /// * [`Error::UnableToDetermineServerPort`] &ndash; no port number was
+    ///   included in the authority of the target URI, and no default port
+    ///   number could be determined from the target URI scheme.
+    /// * [`Error::BadRequest`] &ndash; the HTTP request could not be encoded as
+    ///   a byte stream to be sent to the web server.
+    /// * [`Error::UnableToConnect`] &ndash; a connection to the web server
+    ///   could not be established.
+    /// * [`Error::UnableToGetPeerAddress`] &ndash; a connection to the web
+    ///   server was established, but the server's remote address could not be
+    ///   determined.
+    /// * [`Error::TlsHandshake`] &ndash; a connection to the web server was
+    ///   established, but the connection could not be secured using Transport
+    ///   Layer Security (TLS).
+    /// * [`Error::Disconnected`] &ndash; the connection to the web server was
+    ///   disconnected before the response to the request could be obtained.
+    /// * [`Error::UnableToSend`] &ndash; a connection to the web server was
+    ///   established, but the request could not be sent using it.
+    /// * [`Error::UnableToReceive`] &ndash; a connection to the web server was
+    ///   established, but the response could not be received using it.
+    /// * [`Error::BadResponse`] &ndash; the response from the web server could
+    ///   not be parsed correctly.
+    ///
+    /// [`ConnectionUse::MultipleResources`]:
+    /// enum.ConnectionUse.html#variant.MultipleResources
+    /// [`ConnectionUse::Upgrade`]:
+    /// enum.ConnectionUse.html#variant.Upgrade
+    /// [`Error::HostNotValidText`]: enum.Error.html#variant.HostNotValidText
+    /// [`Error::NoTargetAuthority`]: enum.Error.html#variant.NoTargetAuthority
+    /// [`Error::UnableToDetermineServerPort`]:
+    /// enum.Error.html#variant.UnableToDetermineServerPort
+    /// [`Error::BadRequest`]: enum.Error.html#variant.BadRequest
+    /// [`Error::UnableToConnect`]: enum.Error.html#variant.UnableToConnect
+    /// [`Error::UnableToGetPeerAddress`]:
+    /// enum.Error.html#variant.UnableToGetPeerAddress
+    /// [`Error::TlsHandshake`]: enum.Error.html#variant.TlsHandshake
+    /// [`Error::Disconnected`]: enum.Error.html#variant.Disconnected
+    /// [`Error::UnableToSend`]: enum.Error.html#variant.UnableToSend
+    /// [`Error::UnableToReceive`]: enum.Error.html#variant.UnableToReceive
+    /// [`Error::BadResponse`]: enum.Error.html#variant.BadResponse
     pub async fn fetch<Req>(
         &self,
         request: Req,
@@ -278,6 +376,8 @@ impl HttpClient {
         }
     }
 
+    /// Return a new HTTP client which can send requests to web servers
+    /// and obtain back responses.
     #[must_use]
     pub fn new() -> Self {
         Self {
