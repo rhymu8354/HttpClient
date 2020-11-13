@@ -60,7 +60,11 @@ use rhymuweb::{
     Response,
     ResponseParseStatus,
 };
-use std::fmt::Write;
+use rustls::ClientConfig as TlsClientConfig;
+use std::{
+    fmt::Write,
+    sync::Arc,
+};
 
 /// This is a collection of traits which the connections established by
 /// [`HttpClient`] implement.
@@ -137,7 +141,9 @@ pub struct FetchResults {
 /// This type is used to fetch resources from web servers using the Hypertext
 /// Transfer Protocol (HTTP) 1.1.  Use the [`fetch`] asynchronous function to
 /// send a request and obtain a response.
+#[must_use]
 pub struct HttpClient {
+    tls_config: Option<Arc<TlsClientConfig>>,
     pantry: Pantry<ConnectionKey, Box<dyn Connection>>,
 }
 
@@ -171,7 +177,10 @@ impl HttpClient {
         // Wrap with TLS connector if necessary.
         Ok(ConnectResults {
             connection: if use_tls {
-                let tls_connector = TlsConnector::default();
+                let tls_connector = match &self.tls_config {
+                    Some(tls_config) => TlsConnector::from(tls_config.clone()),
+                    None => TlsConnector::default(),
+                };
                 let tls_connection = tls_connector
                     .connect(host, connection)
                     .await
@@ -380,11 +389,22 @@ impl HttpClient {
         }
     }
 
-    /// Return a new HTTP client which can send requests to web servers
-    /// and obtain back responses.
-    #[must_use]
+    /// Return a new HTTP client which can send requests to web servers and
+    /// obtain back responses.  The client will use the given configuration if
+    /// it needs to connect using TLS.
+    pub fn from_tls_config(tls_config: Arc<TlsClientConfig>) -> Self {
+        Self {
+            tls_config: Some(tls_config),
+            pantry: Pantry::new(),
+        }
+    }
+
+    /// Return a new HTTP client which can send requests to web servers and
+    /// obtain back responses.  The client will use a default configuration
+    /// if it needs to connect using TLS.
     pub fn new() -> Self {
         Self {
+            tls_config: None,
             pantry: Pantry::new(),
         }
     }
