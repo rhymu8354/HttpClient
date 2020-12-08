@@ -19,7 +19,7 @@ pantry = "1.0"
 rhymuri = "1.1"
 rhymuweb = "1.0"
 thiserror = "1.0"
-rustls = "0.18"
+rustls = "0.19"
 
 [dev-dependencies]
 anyhow = "1.0"
