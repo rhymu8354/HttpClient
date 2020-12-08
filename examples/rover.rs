@@ -105,7 +105,7 @@ async fn main_async() {
 fn main() {
     futures::executor::block_on(async {
         select!(
-            () = main_async().fuse() => (),
+            () = main_async().fuse() => {},
             () = CtrlC::new().unwrap().fuse() => {
                 println!("(Ctrl+C pressed; aborted)");
             },
