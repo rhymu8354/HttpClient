@@ -275,9 +275,13 @@ impl HttpClient {
             // Determine the server hostname and include it in the request
             // headers.  If we are connecting on a non-standard port,
             // include the port number as well.
-            let host = std::str::from_utf8(authority.host()).map_err(|_| {
-                Error::HostNotValidText(authority.host().to_vec())
-            })?;
+            let host =
+                std::str::from_utf8(authority.host()).map_err(|source| {
+                    Error::HostNotValidText {
+                        host: authority.host().to_vec(),
+                        source,
+                    }
+                })?;
             let mut host_header_value = String::from(host);
             if match (scheme.as_deref(), port) {
                 (Some("http"), 80)

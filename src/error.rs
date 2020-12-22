@@ -1,3 +1,5 @@
+use std::str::Utf8Error;
+
 /// This is the enumeration of all the different kinds of errors which this
 /// crate generates.
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +20,14 @@ pub enum Error {
 
     /// The attached host in the target URI did not parse as valid text.
     #[error("unable to parse target URI host as text")]
-    HostNotValidText(Vec<u8>),
+    HostNotValidText {
+        /// These are the bytes that did not parse as valid host text.
+        host: Vec<u8>,
+
+        /// This is the source of the parsing error.
+        #[source]
+        source: Utf8Error,
+    },
 
     /// No authority was provided in the target URI, so the user agent doesn't
     /// know to whom to send the request.
