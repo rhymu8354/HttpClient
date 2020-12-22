@@ -17,7 +17,7 @@ async-trait = "0.1"
 futures = "0.3"
 pantry = "1.0"
 rhymuri = "1.2"
-rhymuweb = "1.0"
+rhymuweb = "1.1"
 thiserror = "1.0"
 rustls = "0.19"
 
