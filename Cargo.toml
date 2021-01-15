@@ -11,7 +11,7 @@ keywords = ["http", "client"]
 repository = "https://github.com/rhymu8354/HttpClient.git"
 
 [dependencies]
-async-std = "1.6"
+async-std = "1.9"
 async-tls = "0.11"
 async-trait = "0.1"
 futures = "0.3"
