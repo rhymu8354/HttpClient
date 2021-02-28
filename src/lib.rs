@@ -141,6 +141,8 @@ pub struct FetchResults {
 /// This type is used to fetch resources from web servers using the Hypertext
 /// Transfer Protocol (HTTP) 1.1.  Use the [`fetch`] asynchronous function to
 /// send a request and obtain a response.
+///
+/// [`fetch`]: #method.fetch
 #[must_use]
 pub struct HttpClient {
     tls_config: Option<Arc<TlsClientConfig>>,
