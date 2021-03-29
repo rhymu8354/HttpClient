@@ -377,18 +377,18 @@ impl HttpClient {
                             trailer,
                         }),
                     });
-                } else {
-                    // Park the connection for possible reuse.
-                    if let ConnectionUse::MultipleResources = &connection_use {
-                        self.store_connection(host, port, use_tls, connection);
-                    }
-
-                    // Return the response received.
-                    return Ok(FetchResults {
-                        response,
-                        upgrade: None,
-                    });
                 }
+
+                // Park the connection for possible reuse.
+                if let ConnectionUse::MultipleResources = &connection_use {
+                    self.store_connection(host, port, use_tls, connection);
+                }
+
+                // Return the response received.
+                return Ok(FetchResults {
+                    response,
+                    upgrade: None,
+                });
             }
         } else {
             Err(Error::NoTargetAuthority(request.target))
